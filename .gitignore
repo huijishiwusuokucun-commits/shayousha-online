@@ -1,0 +1,14 @@
+# 秘密情報は絶対に公開しない（パスワード・Turso接続情報）
+.streamlit/secrets.toml
+
+# ローカルのデータベース（オンラインではTursoに保存するため上げない）
+shayosha.db
+*.db
+
+# Pythonの一時ファイル
+__pycache__/
+*.pyc
+
+# 検証用の一時ファイル
+_verify*.py
+_verify_result.txt

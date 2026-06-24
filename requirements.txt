@@ -1,0 +1,5 @@
+streamlit
+pandas
+jpholiday
+openpyxl
+requests
