@@ -170,7 +170,10 @@ class TursoConn:
         resp = self._requests.post(
             self._endpoint, headers=self._headers,
             data=json.dumps({"requests": requests_list}), timeout=30)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # サーバーの具体的な理由を読めるようにする
+            raise RuntimeError(
+                f"Turso HTTP {resp.status_code}: {resp.text[:400]}")
         data = resp.json()
         for res in data.get("results", []):
             if res.get("type") == "error":
@@ -190,10 +193,12 @@ class TursoConn:
         return _TursoCursor(cols, rows)
 
     def executescript(self, script):
+        # Tursoは1回のpipelineに複数SQLをまとめると400を返すことがあるため、
+        # 1文ずつ確実に送る。
         stmts = [s.strip() for s in script.split(";") if s.strip()]
-        reqs = [{"type": "execute", "stmt": {"sql": s}} for s in stmts]
-        reqs.append({"type": "close"})
-        self._pipeline(reqs)
+        for s in stmts:
+            self._pipeline([{"type": "execute", "stmt": {"sql": s}},
+                            {"type": "close"}])
         return _TursoCursor([], [])
 
     def commit(self):
