@@ -409,6 +409,10 @@ def day_status_label(d: datetime.date) -> str:
     return "出勤"
 
 
+# 掃除当番のローテーションから除外するメンバー（朝礼の輪番には影響しない）
+DUTY_EXCLUDED_NAMES = {"門脇", "平岡"}
+
+
 def build_duty_map(start: datetime.date, end: datetime.date):
     """
     期間内の各営業日に掃除当番を割り当てる。
@@ -417,11 +421,18 @@ def build_duty_map(start: datetime.date, end: datetime.date):
     掃除当番を「名簿のメンバー名」に直接編集した日は“アンカー”として扱い、
     その日のローテーション位置をそのメンバーに合わせ直す。
     これにより、その日以降の当番も編集後の人から名簿順で続く。
+
+    なお DUTY_EXCLUDED_NAMES の人は掃除当番の輪番から外す（朝礼には影響しない）。
     戻り値: {date: メンバー名}
     """
     members = get_members()
     if not members:
         return {}
+    # 掃除当番のローテーション対象（除外メンバーを抜く）
+    duty_members = [m for m in members if m["name"] not in DUTY_EXCLUDED_NAMES]
+    if not duty_members:           # 全員除外になってしまう場合の保険
+        duty_members = members
+    members = duty_members
     name_to_idx = {m["name"]: i for i, m in enumerate(members)}
     try:
         base = datetime.date.fromisoformat(get_setting("rotation_base_date", "2026-01-05"))
