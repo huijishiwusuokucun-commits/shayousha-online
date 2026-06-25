@@ -253,6 +253,7 @@ def init_db():
                 end_time TEXT NOT NULL,
                 user_name TEXT NOT NULL,
                 purpose TEXT DEFAULT '',
+                transferable INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now', 'localtime'))
             );
             CREATE TABLE IF NOT EXISTS usage_logs (
@@ -290,6 +291,10 @@ def init_db():
             conn.execute("ALTER TABLE day_overrides ADD COLUMN note TEXT")
         if "duty_swap" not in cols:
             conn.execute("ALTER TABLE day_overrides ADD COLUMN duty_swap TEXT")
+        # 予約テーブルに「譲れる」フラグ列を追加（既存DB対応）
+        rcols = [r[1] for r in conn.execute("PRAGMA table_info(reservations)").fetchall()]
+        if "transferable" not in rcols:
+            conn.execute("ALTER TABLE reservations ADD COLUMN transferable INTEGER DEFAULT 0")
         # 設定の初期値（既にあれば上書きしない）
         defaults = {
             "weekly_event_name": "朝礼",           # 名前は設定画面で変更可能
@@ -571,6 +576,10 @@ def page_calendar():
     first = datetime.date(year, month, 1)
     last = datetime.date(year, month, calendar.monthrange(year, month)[1])
 
+    mobile = st.toggle(
+        "📱 スマホ表示（1日ずつ大きく見やすく）", key="mobile_view",
+        help="スマホなど画面が狭いときに、横スクロール不要の『1日ずつカード表示』に切り替えます。")
+
     duty = build_duty_map(first, last)            # 自動ローテーションの当番
     events = build_weekly_events(first, last)      # 自動の朝礼
     reservations = get_reservations_between(first, last)
@@ -626,8 +635,132 @@ def page_calendar():
             # 表示中の月以外なら開きっぱなしにしない
             del st.session_state["editnote_date"]
 
+    # カレンダーの入替セルをクリックしたとき、その日の入替入力欄を開く
+    es_str = st.session_state.get("editswap_date")
+    if es_str:
+        try:
+            es_date = datetime.date.fromisoformat(es_str)
+        except ValueError:
+            es_date = None
+        if es_date and first <= es_date <= last:
+            with st.container(border=True):
+                st.markdown(
+                    f"**🔁 {es_date.month}/{es_date.day}"
+                    f"（{WEEKDAY_JP[es_date.weekday()]}）の掃除当番を交代（入替）**")
+                st.caption(f"予定の当番：{eff_duty(es_date) or '（なし）'}　→　交代後の人を選んでください。"
+                           "（その日だけの差し替え。ローテーション順は変わりません）")
+                cur_swap = eff_swap(es_date)
+                member_names = [m["name"] for m in get_members()]
+                opts = ["（入替なし）"] + member_names
+                if cur_swap and cur_swap not in member_names:
+                    opts.insert(1, cur_swap)
+                sw_idx = opts.index(cur_swap) if cur_swap in opts else 0
+                new_swap = st.selectbox("交代後の人", opts, index=sw_idx,
+                                        key=f"quickswap_input_{es_str}")
+                sc1, sc2, _ = st.columns([1, 1, 4])
+                if sc1.button("💾 保存", type="primary", key="quickswap_save"):
+                    cu = overrides.get(es_date, {})
+                    val = None if new_swap == "（入替なし）" else new_swap
+                    save_day_override(es_date, cu.get("duty"), cu.get("event"),
+                                      cu.get("note"), val)
+                    del st.session_state["editswap_date"]
+                    st.rerun()
+                if sc2.button("閉じる", key="quickswap_close"):
+                    del st.session_state["editswap_date"]
+                    st.rerun()
+        else:
+            del st.session_state["editswap_date"]
+
     if not get_members():
         st.warning("掃除当番メンバーが未登録です。「⚙️ 設定」画面で登録してください。")
+
+    # ------------------------------------------------------------
+    # スマホ向け表示：1日ずつのカード（横スクロール不要）
+    # ------------------------------------------------------------
+    if mobile:
+        cards = """
+        <style>
+          .daycard {border:1px solid #ccc; border-radius:10px; margin:10px 0;
+                    padding:10px 12px; background:#fff;}
+          .daycard.today {background:#fffbe0; border-color:#e0c000; border-width:2px;}
+          .daycard.hol {background:#fdeeee;}
+          .daycard.sat {background:#eef5ff;}
+          .dc-date {font-size:21px; font-weight:800;}
+          .dc-date .badge {font-size:13px; border-radius:4px; padding:1px 6px;
+                           color:#fff; margin-left:6px;}
+          .dc-date .badge.work {background:#2e7d32;} .dc-date .badge.off {background:#c62828;}
+          .dc-row {font-size:17px; margin-top:5px; line-height:1.5;}
+          .dc-label {display:inline-block; min-width:5.2em; color:#555; font-weight:bold;}
+          .dc-row a {color:#06c; text-decoration:none;}
+          .dc-duty {background:#e8f5e9; border-radius:4px; padding:1px 6px; font-weight:bold;}
+          .dc-swap {background:#ffe0b2; border-radius:4px; padding:1px 6px; font-weight:bold;
+                    color:#e65100;}
+          .dc-event {background:#fff3e0; border-radius:4px; padding:1px 6px; font-weight:bold;}
+        </style>
+        """
+        d = first
+        while d <= last:
+            wd = d.weekday()
+            workday = is_workday(d)
+            newyear = is_newyear_closed(d)
+            hname = jpholiday.is_holiday_name(d)
+            cls = []
+            if not workday:
+                cls.append("hol")
+            elif wd == 5:
+                cls.append("sat")
+            if d == today:
+                cls.append("today")
+            iso = d.isoformat()
+
+            if newyear:
+                badge = '<span class="badge off">事務所休み</span>'
+            elif hname:
+                badge = f'<span class="badge off">{hname}</span>'
+            elif workday:
+                badge = '<span class="badge work">出勤</span>'
+            else:
+                badge = '<span class="badge off">休</span>'
+            head = f'<div class="dc-date">{d.month}/{d.day}（{WEEKDAY_JP[wd]}）{badge}</div>'
+
+            # 予約
+            day_resv = reservations.get(d, [])
+            if day_resv:
+                items = []
+                for r in day_resv:
+                    t = f'{r["start_time"]}-{r["end_time"]} {_esc(r["user_name"])}'
+                    if r["purpose"]:
+                        t += f'（{_esc(r["purpose"])}）'
+                    if r.get("transferable"):
+                        t = (f'<span style="color:#d00; font-weight:bold;">🔁{t}'
+                             f'（譲れます）</span>')
+                    items.append(t)
+                resv_html = ("<br>".join(items)
+                             + f' <a href="?nav=resv&date={iso}" target="_self">［予約変更］</a>')
+            else:
+                resv_html = f'<a href="?nav=resv&date={iso}" target="_self">＋ 予約する</a>'
+
+            ed, ee, en, es = eff_duty(d), eff_event(d), eff_note(d), eff_swap(d)
+            duty_html = f'<span class="dc-duty">{_esc(ed)}</span>' if ed else "—"
+            if es:
+                duty_html += f' → <span class="dc-swap">🔁{_esc(es)}</span>'
+            duty_html += f' <a href="?nav=swap&date={iso}" target="_self">［入替］</a>'
+            event_html = f'<span class="dc-event">{_esc(ee)}</span>' if ee else "—"
+            note_html = (f'{_esc(en)} ' if en else "")
+            note_html += f'<a href="?nav=note&date={iso}" target="_self">［{"編集" if en else "＋ 入力"}］</a>'
+
+            cards += (
+                f'<div class="daycard {" ".join(cls)}">{head}'
+                f'<div class="dc-row"><span class="dc-label">🚗 予約</span>{resv_html}</div>'
+                f'<div class="dc-row"><span class="dc-label">🧹 当番</span>{duty_html}</div>'
+                f'<div class="dc-row"><span class="dc-label">📌 朝礼</span>{event_html}</div>'
+                f'<div class="dc-row"><span class="dc-label">📝 備考</span>{note_html}</div>'
+                f'</div>')
+            d += datetime.timedelta(days=1)
+        st.markdown(cards, unsafe_allow_html=True)
+        st.caption("🚗予約・🔁入替・📝備考の各リンクをタップすると、その場で入力・変更できます。"
+                   "通常の一覧表に戻すには、上の「📱 スマホ表示」をオフにしてください。")
+        return
 
     def status_text(d):
         """その日の区分（出勤／休）を絵文字付きで表す"""
@@ -743,14 +876,18 @@ def page_calendar():
                 continue
             left = (s - day_start_min) / total_min * 100
             width = (e - s) / total_min * 100
-            color = vehicle_color.get(r["vehicle_id"], "#64b5f6")
-            label_txt = f'{r["start_time"]}-{r["end_time"]} {r["user_name"]}'
+            yieldable = bool(r.get("transferable"))
+            # 「譲れる」予約は赤色で目立たせる
+            color = "#e53935" if yieldable else vehicle_color.get(r["vehicle_id"], "#64b5f6")
+            label_txt = ("🔁" if yieldable else "") + f'{r["start_time"]}-{r["end_time"]} {r["user_name"]}'
             if r["purpose"]:
                 label_txt += f'（{r["purpose"]}）'
+            title_txt = (f'{r["vehicle_name"]} {r["start_time"]}-{r["end_time"]} '
+                         f'{r["user_name"]} {r["purpose"]}'
+                         + ("（他の人に譲れます）" if yieldable else ""))
             bars += (f'<div class="tl-bar" style="left:{left:.2f}%; width:{width:.2f}%; '
                      f'top:{j * 28 + 2}px; background:{color};" '
-                     f'title="{r["vehicle_name"]} {r["start_time"]}-{r["end_time"]} '
-                     f'{r["user_name"]} {r["purpose"]}">'
+                     f'title="{title_txt}">'
                      f'{label_txt}</div>')
         height = max(len(day_resv) * 28 + 4, 30)
         iso = d.isoformat()
@@ -761,8 +898,11 @@ def page_calendar():
 
         ed, ee, en, es = eff_duty(d), eff_event(d), eff_note(d), eff_swap(d)
         duty_cell = f'<span class="duty">{ed}</span>' if ed else ""
-        swap_cell = (f'<span class="duty" style="background:#ffe0b2;">{_esc(es)}</span>'
-                     if es else "")
+        # 入替セル＝クリックでその日の入替入力欄を開くリンク
+        swap_disp = (f'<span class="duty" style="background:#ffe0b2;">{_esc(es)}</span>'
+                     if es else '<span class="noteempty">＋ 入力</span>')
+        swap_cell = (f'<a class="notelink" href="?nav=swap&date={iso}" target="_self" '
+                     f'title="クリックで入替を入力">{swap_disp}</a>')
         event_cell = f'<span class="event">{ee}</span>' if ee else ""
         # 備考セル＝クリックでその日の備考入力欄を開くリンク
         note_inner = _esc(en) if en else '<span class="noteempty">＋ 入力</span>'
@@ -782,8 +922,9 @@ def page_calendar():
             for v in all_vehicles)
         st.markdown(legend, unsafe_allow_html=True)
     st.caption("🟢出勤＝会社の出勤日　🔴休＝休み（日曜・祝日・年始・休みの土曜）　"
-               "🚗＝車両予約（バーにマウスを乗せると詳細表示）。"
+               "🚗＝車両予約（バーにマウスを乗せると詳細表示／🔁赤色＝他の人に譲れる予約）。"
                "👉 **時間帯の列をクリック**すると、その日の車両予約画面へ移動します。"
+               "👉 **入替の列をクリック**すると、その日の掃除当番の交代を入力できます。"
                "👉 **備考の列をクリック**すると、その日の備考をその場で入力できます。")
 
     # ------------------------------------------------------------
@@ -908,6 +1049,7 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
       table.sched td.veh {background:#f0f2f6; font-weight:bold; font-size:14px; padding:0 4px;
                           text-align:left; white-space:normal;}
       td.booked {background:#64b5f6; color:#fff;}
+      td.yield {background:#e53935; color:#fff;}
       td.select {background:#a5d6a7;}
       td.conflict {background:#ef9a9a;}
       td.free {background:#fff;}
@@ -937,9 +1079,11 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
                          f'{hit["end_time"]} {hit["user_name"]}">×</td>')
             elif hit:
                 text = hit["user_name"] if hit["start_time"] == s or i == 0 else ""
-                html += (f'<td class="booked" '
+                cls = "yield" if hit.get("transferable") else "booked"
+                ymark = "（譲れます）" if hit.get("transferable") else ""
+                html += (f'<td class="{cls}" '
                          f'title="{hit["start_time"]}-{hit["end_time"]} '
-                         f'{hit["user_name"]} {hit["purpose"]}">{text}</td>')
+                         f'{hit["user_name"]} {hit["purpose"]}{ymark}">{text}</td>')
             elif selected:
                 html += '<td class="select"></td>'
             else:
@@ -948,9 +1092,17 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
     html += "</table>"
     st.markdown(html, unsafe_allow_html=True)
     if rows:
-        st.caption("　".join(
-            f'🚗 {r["vehicle_name"]} {r["start_time"]}-{r["end_time"]} '
-            f'{r["user_name"]} {r["purpose"]}' for r in rows))
+        parts = []
+        for r in rows:
+            txt = (f'🚗 {_esc(r["vehicle_name"])} {r["start_time"]}-{r["end_time"]} '
+                   f'{_esc(r["user_name"])} {_esc(r["purpose"])}')
+            if r["transferable"]:
+                parts.append(f'<span style="color:#d00; font-weight:bold;">{txt}'
+                             f'（🔁譲れます）</span>')
+            else:
+                parts.append(txt)
+        st.markdown('<div style="font-size:13px; color:#666;">'
+                    + "　".join(parts) + "</div>", unsafe_allow_html=True)
 
 
 def page_reservation():
@@ -970,7 +1122,8 @@ def page_reservation():
     # その日・その車両の既存予約（修正対象の選択に使う）
     with get_conn() as conn:
         day_rows = conn.execute(
-            """SELECT id, start_time, end_time, user_name, purpose FROM reservations
+            """SELECT id, start_time, end_time, user_name, purpose, transferable
+               FROM reservations
                WHERE date=? AND vehicle_id=? ORDER BY start_time""",
             (sel_date.isoformat(), vehicle["id"]),
         ).fetchall()
@@ -986,8 +1139,10 @@ def page_reservation():
         cur = next(r for r in day_rows if r["id"] == target_id)
         def_range = (cur["start_time"], cur["end_time"])
         def_name, def_purpose = cur["user_name"], cur["purpose"]
+        def_yield = bool(cur["transferable"])
     else:
         def_range, def_name, def_purpose = ("09:00", "12:00"), "", ""
+        def_yield = False
 
     # 対象を切り替えると初期値が入るよう、ウィジェットのkeyに対象IDを含める
     start_s, end_s = st.select_slider(
@@ -1006,12 +1161,15 @@ def page_reservation():
         user_name = c3.text_input("利用者名 *", value=def_name, key=f"resv_user_{target_id}")
     user_name = (user_name or "").strip()
     purpose = c4.text_input("行き先・目的", value=def_purpose, key=f"resv_purpose_{target_id}")
+    allow_yield = st.checkbox(
+        "🔁 この時間帯は他の人に譲れます（カレンダーに赤字で表示）",
+        value=def_yield, key=f"resv_yield_{target_id}")
 
     # 選択中の時間帯をタイムライン上にリアルタイム表示（修正中の予約は除外して判定）
     render_schedule_grid(sel_date, vehicles, preview_vehicle_id=vehicle["id"],
                          preview_range=(start_s, end_s),
                          exclude_id=(target_id if editing else None))
-    st.caption("青＝予約済み　🟩緑＝選択中の時間帯　🟥赤×＝重複（取れません）")
+    st.caption("青＝予約済み　🔴赤＝他の人に譲れる予約　🟩緑＝選択中の時間帯　🟥赤×＝重複（取れません）")
 
     if start_s >= end_s:
         st.warning("終了は開始より後になるよう、スライダーの右端を動かしてください。")
@@ -1046,14 +1204,16 @@ def page_reservation():
                         if editing:
                             conn.execute(
                                 """UPDATE reservations SET start_time=?, end_time=?,
-                                   user_name=?, purpose=? WHERE id=?""",
-                                (start_s, end_s, user_name, purpose.strip(), target_id))
+                                   user_name=?, purpose=?, transferable=? WHERE id=?""",
+                                (start_s, end_s, user_name, purpose.strip(),
+                                 int(allow_yield), target_id))
                         else:
                             conn.execute(
                                 """INSERT INTO reservations(date, vehicle_id, start_time,
-                                   end_time, user_name, purpose) VALUES(?,?,?,?,?,?)""",
+                                   end_time, user_name, purpose, transferable)
+                                   VALUES(?,?,?,?,?,?,?)""",
                                 (sel_date.isoformat(), vehicle["id"], start_s, end_s,
-                                 user_name, purpose.strip()))
+                                 user_name, purpose.strip(), int(allow_yield)))
                 if dup:
                     st.error(f"この時間帯は既に予約があります"
                              f"（{dup['start_time']}-{dup['end_time']} {dup['user_name']}）。"
@@ -1068,7 +1228,7 @@ def page_reservation():
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT r.id, r.date, r.vehicle_id, r.start_time, r.end_time,
-                      r.user_name, r.purpose FROM reservations r
+                      r.user_name, r.purpose, r.transferable FROM reservations r
                WHERE r.date >= ? ORDER BY r.date, r.start_time""",
             (jst_today().isoformat(),),
         ).fetchall()
@@ -1080,7 +1240,7 @@ def page_reservation():
     vmap_name2id = {v["name"]: v["id"] for v in vehicles}
     vehicle_names = [v["name"] for v in vehicles]
 
-    list_cols = ["id", "利用日", "区分", "車両", "開始", "終了", "利用者名", "行き先"]
+    list_cols = ["id", "利用日", "区分", "車両", "開始", "終了", "利用者名", "行き先", "🔁譲れる"]
     rdf_rows = []
     for r in rows:
         rd = datetime.date.fromisoformat(r["date"])
@@ -1093,6 +1253,7 @@ def page_reservation():
             "終了": r["end_time"],
             "利用者名": r["user_name"],
             "行き先": r["purpose"],
+            "🔁譲れる": bool(r["transferable"]),
         })
     rdf = pd.DataFrame(rdf_rows) if rdf_rows else pd.DataFrame(columns=list_cols)
 
@@ -1116,6 +1277,8 @@ def page_reservation():
             "終了": st.column_config.SelectboxColumn("終了", options=TIME_SLOTS[1:], required=True),
             "利用者名": st.column_config.SelectboxColumn("利用者名", options=user_options, required=True),
             "行き先": st.column_config.TextColumn("行き先"),
+            "🔁譲れる": st.column_config.CheckboxColumn(
+                "🔁譲れる", help="チェックすると、その予約はカレンダーに赤字で表示されます"),
         },
     )
 
@@ -1137,7 +1300,10 @@ def page_reservation():
                     raise ValueError(f"{user}さんの予約：終了時刻は開始時刻より後にしてください。")
                 d = pd.to_datetime(row["利用日"]).date().isoformat()
                 rid = int(row["id"]) if pd.notna(row["id"]) else None
-                records.append((rid, d, vid, start_s, end_s, user, _cell_str(row["行き先"])))
+                yv = row.get("🔁譲れる")
+                yld = 1 if (pd.notna(yv) and bool(yv)) else 0
+                records.append((rid, d, vid, start_s, end_s, user,
+                                _cell_str(row["行き先"]), yld))
 
             # 同じ車両・同じ日の時間帯重複チェック
             for i in range(len(records)):
@@ -1149,18 +1315,19 @@ def page_reservation():
                             f"{a[3]}-{a[4]} と {b[3]}-{b[4]}")
 
             with get_conn() as conn:
-                for rid, d, vid, start_s, end_s, user, purpose in records:
+                for rid, d, vid, start_s, end_s, user, purpose, yld in records:
                     if rid is not None:
                         seen.add(rid)
                         conn.execute(
                             """UPDATE reservations SET date=?, vehicle_id=?, start_time=?,
-                               end_time=?, user_name=?, purpose=? WHERE id=?""",
-                            (d, vid, start_s, end_s, user, purpose, rid))
+                               end_time=?, user_name=?, purpose=?, transferable=? WHERE id=?""",
+                            (d, vid, start_s, end_s, user, purpose, yld, rid))
                     else:
                         conn.execute(
                             """INSERT INTO reservations(date, vehicle_id, start_time,
-                               end_time, user_name, purpose) VALUES(?,?,?,?,?,?)""",
-                            (d, vid, start_s, end_s, user, purpose))
+                               end_time, user_name, purpose, transferable)
+                               VALUES(?,?,?,?,?,?,?)""",
+                            (d, vid, start_s, end_s, user, purpose, yld))
                 for did in orig_ids - seen:
                     conn.execute("DELETE FROM reservations WHERE id=?", (did,))
             st.success("保存しました。")
@@ -1369,7 +1536,9 @@ def main():
                      "Turso をお使いの場合は接続情報（URL・トークン）をご確認ください。")
             st.exception(e)
             st.stop()
-    require_login()
+    # パスワード認証は廃止（URLを知っていれば誰でも利用可）。
+    # 再度パスワードで保護したくなったら、次行のコメントを外してください。
+    # require_login()
 
     # 全体のフォントを大きくする（既定より約1.25倍）
     st.markdown(
@@ -1403,6 +1572,12 @@ def main():
         ds = qp.get("date")
         if ds:
             st.session_state["editnote_date"] = ds
+        qp.clear()
+    elif nav == "swap":                     # 入替クリック → カレンダーで入替入力を開く
+        st.session_state["menu"] = "📅 カレンダー"
+        ds = qp.get("date")
+        if ds:
+            st.session_state["editswap_date"] = ds
         qp.clear()
 
     st.title("🚗 社用車・当番管理システム")
