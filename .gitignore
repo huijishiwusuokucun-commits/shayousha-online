@@ -12,3 +12,6 @@ __pycache__/
 # 検証用の一時ファイル
 _verify*.py
 _verify_result.txt
+
+# GitHubトークン（絶対に公開しない）
+token.txt
