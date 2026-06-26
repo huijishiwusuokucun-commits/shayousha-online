@@ -305,10 +305,38 @@ def init_db():
             conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v))
 
 
-def get_setting(key, default=""):
+# ------------------------------------------------------------
+# 読み取りキャッシュ（東京DBへの往復回数を減らして高速化）
+#   ・あまり変わらない「設定・メンバー・車両・当番上書き」を一時保持する。
+#   ・対応する書き込みの直後に .clear() でキャッシュを消し、最新を読み直す。
+#   ・予約は頻繁に変わり重複判定に使うため、キャッシュしない。
+# ------------------------------------------------------------
+@st.cache_data(ttl=600, show_spinner=False)
+def _settings_cached():
     with get_conn() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else default
+        rows = conn.execute("SELECT key, value FROM settings").fetchall()
+    return {r["key"]: r["value"] for r in rows}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _members_cached():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM members ORDER BY sort_order, id").fetchall()
+    return [dict(r) for r in rows]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _vehicles_cached(active_only=True):
+    sql = "SELECT * FROM vehicles"
+    if active_only:
+        sql += " WHERE active=1"
+    with get_conn() as conn:
+        rows = conn.execute(sql + " ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_setting(key, default=""):
+    return _settings_cached().get(key, default)
 
 
 def set_setting(key, value):
@@ -318,22 +346,16 @@ def set_setting(key, value):
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, str(value)),
         )
+    _settings_cached.clear()
 
 
 def get_members():
-    """掃除当番メンバーを並び順で取得"""
-    with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM members ORDER BY sort_order, id").fetchall()
-    return [dict(r) for r in rows]
+    """掃除当番メンバーを並び順で取得（キャッシュ）"""
+    return _members_cached()
 
 
 def get_vehicles(active_only=True):
-    sql = "SELECT * FROM vehicles"
-    if active_only:
-        sql += " WHERE active=1"
-    with get_conn() as conn:
-        rows = conn.execute(sql + " ORDER BY id").fetchall()
-    return [dict(r) for r in rows]
+    return _vehicles_cached(active_only)
 
 
 # ============================================================
@@ -530,9 +552,10 @@ def get_reservations_between(start: datetime.date, end: datetime.date):
     return result
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def get_day_overrides(start: datetime.date, end: datetime.date):
     """期間内の手入力上書き（掃除当番・朝礼・備考・入替）を
-    {date: {'duty':.., 'event':.., 'note':.., 'duty_swap':..}} で返す。
+    {date: {'duty':.., 'event':.., 'note':.., 'duty_swap':..}} で返す（キャッシュ）。
     値が None のフィールドは『上書きなし（自動値を使う）』を意味する。"""
     with get_conn() as conn:
         rows = conn.execute(
@@ -560,6 +583,7 @@ def save_day_override(d: datetime.date, duty, event, note, duty_swap):
                 "event=excluded.event, note=excluded.note, duty_swap=excluded.duty_swap",
                 (d.isoformat(), duty, event, note, duty_swap),
             )
+    get_day_overrides.clear()
 
 
 # ============================================================
@@ -797,6 +821,7 @@ def page_calendar():
 
     html = f"""
     <style>
+      .vcal-wrap {{max-height:80vh; overflow:auto; border:1px solid #ccc; border-radius:6px;}}
       table.vcal {{width:100%; border-collapse:collapse;}}
       table.vcal th {{border:1px solid #ccc; padding:5px; background:#f0f2f6; font-size:15px;
                       position:sticky; top:0; z-index:6;
@@ -831,6 +856,7 @@ def page_calendar():
                font-size:18px; line-height:26px; padding:0 4px; overflow:hidden;
                white-space:nowrap;}}
     </style>
+    <div class="vcal-wrap">
     <table class="vcal">
       <tr><th style="width:132px;">日付</th>
           <th>🚗 車両予約（9:00〜17:30）{scale}</th>
@@ -914,7 +940,7 @@ def page_calendar():
                  f'<td>{resv_cell}</td><td>{duty_cell}</td><td>{swap_cell}</td>'
                  f'<td>{event_cell}</td><td>{note_cell}</td></tr>')
         d += datetime.timedelta(days=1)
-    html += "</table>"
+    html += "</table></div>"
     st.markdown(html, unsafe_allow_html=True)
 
     if all_vehicles:
@@ -1393,6 +1419,7 @@ def page_vehicles():
                 for did in orig_ids - seen:
                     conn.execute("DELETE FROM reservations WHERE vehicle_id=?", (did,))
                     conn.execute("DELETE FROM vehicles WHERE id=?", (did,))
+            _vehicles_cached.clear()
             st.success("保存しました。")
             st.rerun()
         except Exception as e:
@@ -1453,6 +1480,7 @@ def page_settings():
                                      (name, i))
                 for did in orig_ids - seen:
                     conn.execute("DELETE FROM members WHERE id=?", (did,))
+            _members_cached.clear()
             st.success("保存しました。")
             st.rerun()
         except Exception as e:
