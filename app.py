@@ -798,7 +798,9 @@ def page_calendar():
     html = f"""
     <style>
       table.vcal {{width:100%; border-collapse:collapse;}}
-      table.vcal th {{border:1px solid #ccc; padding:5px; background:#f0f2f6; font-size:15px;}}
+      table.vcal th {{border:1px solid #ccc; padding:5px; background:#f0f2f6; font-size:15px;
+                      position:sticky; top:0; z-index:6;
+                      box-shadow:inset 0 -1px 0 #ccc, inset 0 1px 0 #ccc;}}
       table.vcal td {{border:1px solid #ccc; padding:7px 6px; font-size:15px; vertical-align:top;}}
       table.vcal td.dcell {{white-space:nowrap; line-height:1.7;}}
       tr.sat td {{background:#eef5ff;}}
