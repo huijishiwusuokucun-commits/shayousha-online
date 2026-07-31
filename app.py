@@ -24,6 +24,24 @@ import pandas as pd
 import streamlit as st
 
 # ============================================================
+# バージョン情報（改修履歴）
+#   画面左のメニュー下部に表示される。改修したら必ずここに追記すること。
+# ============================================================
+APP_VERSION = "1.3.0"
+APP_UPDATED = "2026-07-31"
+CHANGELOG = [
+    ("1.3.0", "2026-07-31",
+     "月を切り替えると直接編集の表が出なくなる不具合を修正／"
+     "1日〜月末までスクロールなしで表示／スマホ表示でも直接編集を可能に"),
+    ("1.2.0", "2026-06-26",
+     "設定・メンバー・車両・当番上書きをキャッシュ化して高速化／見出し行を固定"),
+    ("1.1.0", "2026-06-25",
+     "パスワード廃止／予約の「譲れる」赤字表示／入替の直接入力／スマホ表示を追加"),
+    ("1.0.0", "2026-06-24",
+     "オンライン版として公開（JST判定・掃除当番の入替列を追加）"),
+]
+
+# ============================================================
 # 基本設定
 # ============================================================
 st.set_page_config(page_title="社用車・当番管理", page_icon="🚗", layout="wide")
@@ -439,6 +457,11 @@ def day_status_label(d: datetime.date) -> str:
 # 掃除当番のローテーションから除外するメンバー（朝礼の輪番には影響しない）
 DUTY_EXCLUDED_NAMES = {"門脇", "平岡"}
 
+# 直接編集の表：1行あたりの高さ（px）。
+# 全体の文字を16pxに拡大しているため、既定より広めに取らないと
+# 月末の数日が表内スクロールに隠れてしまう。
+ROW_PX = 44
+
 
 def build_duty_map(start: datetime.date, end: datetime.date):
     """
@@ -698,6 +721,102 @@ def page_calendar():
     if not get_members():
         st.warning("掃除当番メンバーが未登録です。「⚙️ 設定」画面で登録してください。")
 
+    def status_text(d):
+        """その日の区分（出勤／休）を絵文字付きで表す"""
+        lbl = day_status_label(d)
+        return ("🟢 " if lbl == "出勤" else "🔴 ") + lbl
+
+    # ------------------------------------------------------------
+    # 掃除当番・入替・朝礼当番・備考の直接編集（表示中の月ぶん）
+    #   ※ data_editor のキーは「年月」ごとに分ける。
+    #     キーを固定にすると、前の月で編集した内容が次の月にも残ってしまい、
+    #     表が正しく描画されない（8月以降が表示されない）原因になる。
+    # ------------------------------------------------------------
+    def render_direct_editor():
+        st.divider()
+        st.markdown("#### ✏️ 掃除当番・入替・朝礼当番・備考を直接編集")
+        st.caption("各マスをダブルクリックすると書き換えられます。"
+                   "「掃除当番」を名簿のメンバー名に変えると、その日（その週）以降も名簿順で続きます。"
+                   "「🔁入替」は当番を交代したい日に交代後の人を入力します（その日だけ差し替え／"
+                   "ローテーション自体は変わりません）。"
+                   "空欄にすると自動の割り当てに戻ります（備考・入替は空欄で消去）。"
+                   "編集後は「💾 保存」を押してください。")
+
+        rows_data = []
+        d = first
+        while d <= last:
+            rows_data.append({
+                "date": d.isoformat(),
+                "日付": f"{d.month}/{d.day}（{WEEKDAY_JP[d.weekday()]}）",
+                "区分": status_text(d),
+                "🧹 掃除当番": eff_duty(d),
+                "🔁 入替": eff_swap(d),
+                "📌 朝礼当番": eff_event(d),
+                "📝 備考": eff_note(d),
+            })
+            d += datetime.timedelta(days=1)
+        cal_df = pd.DataFrame(rows_data)
+
+        swap_help = "当番を交代する日に、交代後の人を入力（名簿の人を選ぶと確実です）"
+        editor_key = f"cal_editor_{year}_{month:02d}"   # 月ごとに独立したキー
+        try:
+            edited_cal = st.data_editor(
+                cal_df, key=editor_key, num_rows="fixed", hide_index=True,
+                # 1日〜月末までを内部スクロールなしで全部表示する
+                # （文字を大きくしている分、1行あたり余裕を持たせる）
+                width="stretch", height=ROW_PX * (len(cal_df) + 1) + 8,
+                column_config={
+                    "date": None,
+                    "日付": st.column_config.TextColumn("日付", disabled=True),
+                    "区分": st.column_config.TextColumn("区分", disabled=True),
+                    "🧹 掃除当番": st.column_config.TextColumn("🧹 掃除当番"),
+                    "🔁 入替": st.column_config.TextColumn("🔁 入替", help=swap_help),
+                    "📌 朝礼当番": st.column_config.TextColumn("📌 朝礼当番"),
+                    "📝 備考": st.column_config.TextColumn("📝 備考", width="medium"),
+                },
+            )
+        except Exception as e:
+            # 万一この月の編集状態が壊れていても、表ごと消えないようにリセットできるようにする
+            st.error(f"編集表を表示できませんでした: {e}")
+            if st.button("🔄 編集状態をリセットして再表示", key=f"cal_reset_{editor_key}"):
+                st.session_state.pop(editor_key, None)
+                st.rerun()
+            return
+
+        if st.button("💾 保存", type="primary", key=f"cal_save_{year}_{month:02d}"):
+            try:
+                stored = get_day_overrides(first, last)  # 現在の上書き（生の値）
+                for i in range(len(edited_cal)):
+                    row, orig = edited_cal.iloc[i], cal_df.iloc[i]
+                    d = datetime.date.fromisoformat(row["date"])
+                    new_d = _cell_str(row["🧹 掃除当番"])
+                    new_s = _cell_str(row["🔁 入替"])
+                    new_e = _cell_str(row["📌 朝礼当番"])
+                    new_n = _cell_str(row["📝 備考"])
+                    duty_changed = new_d != _cell_str(orig["🧹 掃除当番"])
+                    swap_changed = new_s != _cell_str(orig["🔁 入替"])
+                    event_changed = new_e != _cell_str(orig["📌 朝礼当番"])
+                    note_changed = new_n != _cell_str(orig["📝 備考"])
+                    if not (duty_changed or swap_changed or event_changed or note_changed):
+                        continue
+                    cur = stored.get(d, {"duty": None, "event": None,
+                                         "note": None, "duty_swap": None})
+                    duty_ov, event_ov = cur["duty"], cur["event"]
+                    note_ov, swap_ov = cur["note"], cur["duty_swap"]
+                    if duty_changed:
+                        duty_ov = None if new_d == "" else new_d
+                    if swap_changed:
+                        swap_ov = None if new_s == "" else new_s
+                    if event_changed:
+                        event_ov = None if new_e == "" else new_e
+                    if note_changed:
+                        note_ov = None if new_n == "" else new_n
+                    save_day_override(d, duty_ov, event_ov, note_ov, swap_ov)
+                st.success("カレンダーの変更を保存しました。")
+                st.rerun()
+            except Exception as e:
+                st.error(f"保存できませんでした: {e}")
+
     # ------------------------------------------------------------
     # スマホ向け表示：1日ずつのカード（横スクロール不要）
     # ------------------------------------------------------------
@@ -784,12 +903,10 @@ def page_calendar():
         st.markdown(cards, unsafe_allow_html=True)
         st.caption("🚗予約・🔁入替・📝備考の各リンクをタップすると、その場で入力・変更できます。"
                    "通常の一覧表に戻すには、上の「📱 スマホ表示」をオフにしてください。")
+        # スマホ表示でも、まとめて書き換えたいときのために直接編集の表を使えるようにする
+        with st.expander("✏️ まとめて直接編集する（掃除当番・入替・朝礼当番・備考）"):
+            render_direct_editor()
         return
-
-    def status_text(d):
-        """その日の区分（出勤／休）を絵文字付きで表す"""
-        lbl = day_status_label(d)
-        return ("🟢 " if lbl == "出勤" else "🔴 ") + lbl
 
     # ------------------------------------------------------------
     # 車両予約のガントチャート表示（9:00〜17:30）＋当番の一覧（読み取り専用）
@@ -821,7 +938,8 @@ def page_calendar():
 
     html = f"""
     <style>
-      .vcal-wrap {{max-height:80vh; overflow:auto; border:1px solid #ccc; border-radius:6px;}}
+      /* 1日〜月末まで内部スクロールなしで全部見えるようにする（高さ制限なし） */
+      .vcal-wrap {{overflow-x:auto; border:1px solid #ccc; border-radius:6px;}}
       table.vcal {{width:100%; border-collapse:collapse;}}
       table.vcal th {{border:1px solid #ccc; padding:5px; background:#f0f2f6; font-size:15px;
                       position:sticky; top:0; z-index:6;
@@ -955,82 +1073,7 @@ def page_calendar():
                "👉 **入替の列をクリック**すると、その日の掃除当番の交代を入力できます。"
                "👉 **備考の列をクリック**すると、その日の備考をその場で入力できます。")
 
-    # ------------------------------------------------------------
-    # 掃除当番・朝礼当番の直接編集
-    # ------------------------------------------------------------
-    st.divider()
-    st.markdown("#### ✏️ 掃除当番・入替・朝礼当番・備考を直接編集")
-    st.caption("各マスをダブルクリックすると書き換えられます。"
-               "「掃除当番」を名簿のメンバー名に変えると、その日（その週）以降も名簿順で続きます。"
-               "「🔁入替」は当番を交代したい日に交代後の人を入力します（その日だけ差し替え／"
-               "ローテーション自体は変わりません）。"
-               "空欄にすると自動の割り当てに戻ります（備考・入替は空欄で消去）。"
-               "編集後は「💾 保存」を押してください。")
-
-    rows_data = []
-    d = first
-    while d <= last:
-        rows_data.append({
-            "date": d.isoformat(),
-            "日付": f"{d.month}/{d.day}（{WEEKDAY_JP[d.weekday()]}）",
-            "区分": status_text(d),
-            "🧹 掃除当番": eff_duty(d),
-            "🔁 入替": eff_swap(d),
-            "📌 朝礼当番": eff_event(d),
-            "📝 備考": eff_note(d),
-        })
-        d += datetime.timedelta(days=1)
-    cal_df = pd.DataFrame(rows_data)
-
-    # 入替の選択肢＝名簿（番号順）。名簿外の名前も手入力できるよう自由入力可にする
-    swap_help = "当番を交代する日に、交代後の人を入力（名簿の人を選ぶと確実です）"
-    edited_cal = st.data_editor(
-        cal_df, key="cal_editor", num_rows="fixed", hide_index=True,
-        width="stretch", height=min(36 * (len(cal_df) + 1) + 3, 1200),
-        column_config={
-            "date": None,
-            "日付": st.column_config.TextColumn("日付", disabled=True),
-            "区分": st.column_config.TextColumn("区分", disabled=True),
-            "🧹 掃除当番": st.column_config.TextColumn("🧹 掃除当番"),
-            "🔁 入替": st.column_config.TextColumn("🔁 入替", help=swap_help),
-            "📌 朝礼当番": st.column_config.TextColumn("📌 朝礼当番"),
-            "📝 備考": st.column_config.TextColumn("📝 備考", width="medium"),
-        },
-    )
-
-    if st.button("💾 保存", type="primary", key="cal_save"):
-        try:
-            stored = get_day_overrides(first, last)  # 現在の上書き（生の値）
-            for i in range(len(edited_cal)):
-                row, orig = edited_cal.iloc[i], cal_df.iloc[i]
-                d = datetime.date.fromisoformat(row["date"])
-                new_d = _cell_str(row["🧹 掃除当番"])
-                new_s = _cell_str(row["🔁 入替"])
-                new_e = _cell_str(row["📌 朝礼当番"])
-                new_n = _cell_str(row["📝 備考"])
-                duty_changed = new_d != _cell_str(orig["🧹 掃除当番"])
-                swap_changed = new_s != _cell_str(orig["🔁 入替"])
-                event_changed = new_e != _cell_str(orig["📌 朝礼当番"])
-                note_changed = new_n != _cell_str(orig["📝 備考"])
-                if not (duty_changed or swap_changed or event_changed or note_changed):
-                    continue
-                cur = stored.get(d, {"duty": None, "event": None,
-                                     "note": None, "duty_swap": None})
-                duty_ov, event_ov = cur["duty"], cur["event"]
-                note_ov, swap_ov = cur["note"], cur["duty_swap"]
-                if duty_changed:
-                    duty_ov = None if new_d == "" else new_d
-                if swap_changed:
-                    swap_ov = None if new_s == "" else new_s
-                if event_changed:
-                    event_ov = None if new_e == "" else new_e
-                if note_changed:
-                    note_ov = None if new_n == "" else new_n
-                save_day_override(d, duty_ov, event_ov, note_ov, swap_ov)
-            st.success("カレンダーの変更を保存しました。")
-            st.rerun()
-        except Exception as e:
-            st.error(f"保存できませんでした: {e}")
+    render_direct_editor()
 
 
 # ============================================================
@@ -1629,6 +1672,13 @@ def main():
         # データ保存先の表示（Turso接続の確認用）
         st.caption("💾 保存先：☁️ Turso（クラウド）" if using_turso()
                    else "💾 保存先：このサーバー内（ローカル）")
+
+        # バージョン表示（更新が反映されたかの確認用）
+        st.divider()
+        st.caption(f"📌 バージョン **v{APP_VERSION}**（{APP_UPDATED} 更新）")
+        with st.expander("改修履歴を見る"):
+            for ver, day, desc in CHANGELOG:
+                st.markdown(f"**v{ver}**（{day}）<br>{desc}", unsafe_allow_html=True)
 
     try:
         if page == "📅 カレンダー":
