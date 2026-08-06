@@ -27,9 +27,12 @@ import streamlit as st
 # バージョン情報（改修履歴）
 #   画面左のメニュー下部に表示される。改修したら必ずここに追記すること。
 # ============================================================
-APP_VERSION = "1.3.0"
-APP_UPDATED = "2026-07-31"
+APP_VERSION = "1.4.0"
+APP_UPDATED = "2026-08-06"
 CHANGELOG = [
+    ("1.4.0", "2026-08-06",
+     "月間カレンダーの見出し行（日付・車両予約の時間目盛り）と日付列を固定／"
+     "1日〜月末までを表の中でスクロールして全部見られるように変更"),
     ("1.3.0", "2026-07-31",
      "月を切り替えると直接編集の表が出なくなる不具合を修正／"
      "1日〜月末までスクロールなしで表示／スマホ表示でも直接編集を可能に"),
@@ -943,17 +946,31 @@ def page_calendar():
 
     html = f"""
     <style>
-      /* 1日〜月末まで内部スクロールなしで全部見えるようにする（高さ制限なし） */
-      .vcal-wrap {{overflow-x:auto; border:1px solid #ccc; border-radius:6px;}}
+      /* 1日〜月末までの全日を描画したうえで、枠の中でスクロールさせる。
+         見出し行（日付・🚗車両予約の時間目盛り など）は上に固定、
+         日付列は左に固定するので、どこまでスクロールしても
+         「何日の・何時の欄か」を見失わない。 */
+      .vcal-wrap {{max-height:78vh; overflow:auto;
+                   border:1px solid #ccc; border-radius:6px;}}
       table.vcal {{width:100%; border-collapse:collapse;}}
       table.vcal th {{border:1px solid #ccc; padding:5px; background:#f0f2f6; font-size:15px;
                       position:sticky; top:0; z-index:6;
                       box-shadow:inset 0 -1px 0 #ccc, inset 0 1px 0 #ccc;}}
       table.vcal td {{border:1px solid #ccc; padding:7px 6px; font-size:15px; vertical-align:top;}}
-      table.vcal td.dcell {{white-space:nowrap; line-height:1.7;}}
+      /* 日付列（左固定）。左上の角セルは縦横どちらにも固定するので z-index を最大にする。 */
+      table.vcal th.dhead {{left:0; z-index:8;
+                      box-shadow:inset 0 -1px 0 #ccc, inset 0 1px 0 #ccc,
+                                 inset -1px 0 0 #ccc;}}
+      table.vcal td.dcell {{white-space:nowrap; line-height:1.7;
+                      position:sticky; left:0; z-index:4; background:#fff;
+                      box-shadow:inset -1px 0 0 #ccc;}}
       tr.sat td {{background:#eef5ff;}}
       tr.hol td {{background:#fdeeee;}}
       tr.today td {{background:#fffbe0;}}
+      /* 固定セルは背景が透けると下の行が見えてしまうため、行の色を明示的に塗り直す */
+      table.vcal tr.sat td.dcell {{background:#eef5ff;}}
+      table.vcal tr.hol td.dcell {{background:#fdeeee;}}
+      table.vcal tr.today td.dcell {{background:#fffbe0;}}
       .red {{color:#d00; font-weight:bold;}}
       .blue {{color:#06c; font-weight:bold;}}
       .todaydate {{font-size:19px; font-weight:900; color:#000;}}
@@ -981,7 +998,7 @@ def page_calendar():
     </style>
     <div class="vcal-wrap">
     <table class="vcal">
-      <tr><th style="width:132px;">日付</th>
+      <tr><th class="dhead" style="width:132px;">日付</th>
           <th>🚗 車両予約（9:00〜17:30）{scale}</th>
           <th style="width:92px;">🧹 掃除当番</th>
           <th style="width:92px;">🔁 入替</th>
