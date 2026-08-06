@@ -617,8 +617,12 @@ def page_calendar():
 
     today = jst_today()
     col1, col2 = st.columns(2)
-    year = col1.selectbox("年", range(today.year - 1, today.year + 3), index=1)
-    month = col2.selectbox("月", range(1, 13), index=today.month - 1)
+    # 既定値をセッションに用意（リンク移動で当月へ戻らないよう key で保持する）
+    st.session_state.setdefault("cal_year", today.year)
+    st.session_state.setdefault("cal_month", today.month)
+    year = col1.selectbox("年", list(range(today.year - 1, today.year + 3)),
+                          key="cal_year")
+    month = col2.selectbox("月", list(range(1, 13)), key="cal_month")
 
     first = datetime.date(year, month, 1)
     last = datetime.date(year, month, calendar.monthrange(year, month)[1])
@@ -855,6 +859,7 @@ def page_calendar():
             if d == today:
                 cls.append("today")
             iso = d.isoformat()
+            qs = f"&y={year}&m={month}"   # 表示中の年月を引き継ぐ
 
             if newyear:
                 badge = '<span class="badge off">事務所休み</span>'
@@ -879,18 +884,18 @@ def page_calendar():
                              f'（譲れます）</span>')
                     items.append(t)
                 resv_html = ("<br>".join(items)
-                             + f' <a href="?nav=resv&date={iso}" target="_self">［予約変更］</a>')
+                             + f' <a href="?nav=resv&date={iso}{qs}" target="_self">［予約変更］</a>')
             else:
-                resv_html = f'<a href="?nav=resv&date={iso}" target="_self">＋ 予約する</a>'
+                resv_html = f'<a href="?nav=resv&date={iso}{qs}" target="_self">＋ 予約する</a>'
 
             ed, ee, en, es = eff_duty(d), eff_event(d), eff_note(d), eff_swap(d)
             duty_html = f'<span class="dc-duty">{_esc(ed)}</span>' if ed else "—"
             if es:
                 duty_html += f' → <span class="dc-swap">🔁{_esc(es)}</span>'
-            duty_html += f' <a href="?nav=swap&date={iso}" target="_self">［入替］</a>'
+            duty_html += f' <a href="?nav=swap&date={iso}{qs}" target="_self">［入替］</a>'
             event_html = f'<span class="dc-event">{_esc(ee)}</span>' if ee else "—"
             note_html = (f'{_esc(en)} ' if en else "")
-            note_html += f'<a href="?nav=note&date={iso}" target="_self">［{"編集" if en else "＋ 入力"}］</a>'
+            note_html += f'<a href="?nav=note&date={iso}{qs}" target="_self">［{"編集" if en else "＋ 入力"}］</a>'
 
             cards += (
                 f'<div class="daycard {" ".join(cls)}">{head}'
@@ -1037,8 +1042,9 @@ def page_calendar():
                      f'{label_txt}</div>')
         height = max(len(day_resv) * 28 + 4, 30)
         iso = d.isoformat()
+        qs = f"&y={year}&m={month}"   # 表示中の年月を引き継ぐ（当月へ戻るのを防ぐ）
         # 時間帯セル＝クリックで車両予約画面へ移動するリンク
-        resv_cell = (f'<a class="resvlink" href="?nav=resv&date={iso}" target="_self" '
+        resv_cell = (f'<a class="resvlink" href="?nav=resv&date={iso}{qs}" target="_self" '
                      f'title="クリックで予約画面へ">'
                      f'<div class="tl" style="height:{height}px;">{bars}</div></a>')
 
@@ -1047,12 +1053,12 @@ def page_calendar():
         # 入替セル＝クリックでその日の入替入力欄を開くリンク
         swap_disp = (f'<span class="duty" style="background:#ffe0b2;">{_esc(es)}</span>'
                      if es else '<span class="noteempty">＋ 入力</span>')
-        swap_cell = (f'<a class="notelink" href="?nav=swap&date={iso}" target="_self" '
+        swap_cell = (f'<a class="notelink" href="?nav=swap&date={iso}{qs}" target="_self" '
                      f'title="クリックで入替を入力">{swap_disp}</a>')
         event_cell = f'<span class="event">{ee}</span>' if ee else ""
         # 備考セル＝クリックでその日の備考入力欄を開くリンク
         note_inner = _esc(en) if en else '<span class="noteempty">＋ 入力</span>'
-        note_cell = (f'<a class="notelink" href="?nav=note&date={iso}" target="_self" '
+        note_cell = (f'<a class="notelink" href="?nav=note&date={iso}{qs}" target="_self" '
                      f'title="クリックで備考を入力">{note_inner}</a>')
         html += (f'<tr class="{" ".join(row_cls)}"><td class="dcell">{date_label}</td>'
                  f'<td>{resv_cell}</td><td>{duty_cell}</td><td>{swap_cell}</td>'
@@ -1631,8 +1637,23 @@ def main():
     # カレンダーのリンク（時間帯・備考）からの画面移動を処理する
     qp = st.query_params
     nav = qp.get("nav")
+
+    def _restore_cal_month():
+        """リンクに含まれる年・月を、表示中のカレンダーに引き継ぐ
+        （押した瞬間に当月へ戻ってしまうのを防ぐ）。"""
+        today = jst_today()
+        try:
+            y, m = int(qp.get("y")), int(qp.get("m"))
+        except (TypeError, ValueError):
+            return
+        if (today.year - 1) <= y <= (today.year + 2):
+            st.session_state["cal_year"] = y
+        if 1 <= m <= 12:
+            st.session_state["cal_month"] = m
+
     if nav == "resv":                       # 時間帯クリック → 車両予約画面へ
         st.session_state["menu"] = "🚗 車両予約"
+        _restore_cal_month()
         ds = qp.get("date")
         if ds:
             try:
@@ -1642,12 +1663,14 @@ def main():
         qp.clear()
     elif nav == "note":                     # 備考クリック → カレンダーで備考入力を開く
         st.session_state["menu"] = "📅 カレンダー"
+        _restore_cal_month()
         ds = qp.get("date")
         if ds:
             st.session_state["editnote_date"] = ds
         qp.clear()
     elif nav == "swap":                     # 入替クリック → カレンダーで入替入力を開く
         st.session_state["menu"] = "📅 カレンダー"
+        _restore_cal_month()
         ds = qp.get("date")
         if ds:
             st.session_state["editswap_date"] = ds
