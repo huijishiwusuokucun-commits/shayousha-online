@@ -919,8 +919,13 @@ def page_calendar():
     # ------------------------------------------------------------
     # 車両予約のガントチャート表示（9:00〜17:30）＋当番の一覧（読み取り専用）
     # ------------------------------------------------------------
-    day_start_min, day_end_min = 9 * 60, 17 * 60 + 30
+    # 予約の終了時刻は月ごとに変わる（2月20:00・3月21:00・通常17:30）。
+    # 表示中の月で判定する（1か月表示なので全日同じ）。
+    day_start_min = DAY_START_MIN
+    day_end_min = day_end_min_for(first)
     total_min = day_end_min - day_start_min
+    grid_pct = 30 / total_min * 100          # 30分ぶんの目盛り幅（％）
+    end_label = _min_to_hhmm(day_end_min)
 
     def to_min(s):
         h, m = s.split(":")
@@ -991,7 +996,7 @@ def page_calendar():
       .tl-scale span.half {{font-size:9px; color:#999;}}
       .tl {{position:relative;
             background:repeating-linear-gradient(to right,
-                       #bbb 0 1px, transparent 1px 5.8824%);}}
+                       #bbb 0 1px, transparent 1px {grid_pct:.4f}%);}}
       .tl-bar {{position:absolute; height:26px; border-radius:3px; color:#fff;
                font-size:18px; line-height:26px; padding:0 4px; overflow:hidden;
                white-space:nowrap;}}
@@ -999,7 +1004,7 @@ def page_calendar():
     <div class="vcal-wrap">
     <table class="vcal">
       <tr><th class="dhead" style="width:132px;">日付</th>
-          <th>🚗 車両予約（9:00〜17:30）{scale}</th>
+          <th>🚗 車両予約（9:00〜{end_label}）{scale}</th>
           <th style="width:92px;">🧹 掃除当番</th>
           <th style="width:92px;">🔁 入替</th>
           <th style="width:110px;">📌 朝礼当番</th>
@@ -1100,14 +1105,33 @@ def page_calendar():
 
 
 # ============================================================
-# 画面：車両予約（タイムスケジュール方式 9:00〜17:30）
+# 画面：車両予約（タイムスケジュール方式）
+#   予約可能時間：通常 9:00〜17:30／2月は20:00まで／3月は21:00まで
 # ============================================================
-# 予約可能な時刻（9:00〜17:30 の30分刻み）
-TIME_SLOTS = []
-_t = datetime.datetime(2000, 1, 1, 9, 0)
-while _t <= datetime.datetime(2000, 1, 1, 17, 30):
-    TIME_SLOTS.append(_t.strftime("%H:%M"))
-    _t += datetime.timedelta(minutes=30)
+DAY_START_MIN = 9 * 60
+
+
+def day_end_min_for(d: datetime.date) -> int:
+    """その日の予約終了時刻（分）。繁忙月は夜間まで延長する。"""
+    if d.month == 2:
+        return 20 * 60          # 2月は夜8時（20:00）まで
+    if d.month == 3:
+        return 21 * 60          # 3月は夜9時（21:00）まで
+    return 17 * 60 + 30         # 通常は17:30まで
+
+
+def _min_to_hhmm(m: int) -> str:
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def time_slots_for(d: datetime.date):
+    """その日の予約可能時刻（30分刻み、9:00〜終了時刻）のリスト。"""
+    end = day_end_min_for(d)
+    return [_min_to_hhmm(t) for t in range(DAY_START_MIN, end + 1, 30)]
+
+
+# 一覧表の選択肢用の最大範囲（9:00〜21:00）。実際の締切は各月のルールに従う。
+TIME_SLOTS_MAX = [_min_to_hhmm(t) for t in range(DAY_START_MIN, 21 * 60 + 1, 30)]
 
 
 def render_schedule_grid(date: datetime.date, vehicles: list,
@@ -1133,7 +1157,8 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
 
     pv_start, pv_end = (preview_range or (None, None))
 
-    slot_starts = TIME_SLOTS[:-1]  # 各セルの開始時刻（9:00〜17:00）
+    slots_full = time_slots_for(date)       # その日の可能時刻（月により終了が変わる）
+    slot_starts = slots_full[:-1]           # 各セルの開始時刻
     html = """
     <style>
       table.sched {border-collapse:collapse; width:100%; table-layout:fixed;}
@@ -1158,7 +1183,7 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
     for v in vehicles:
         html += f'<tr><td class="veh">{v["name"]}</td>'
         for i, s in enumerate(slot_starts):
-            slot_end = TIME_SLOTS[i + 1]
+            slot_end = slots_full[i + 1]
             hit = None
             for r in resv_by_vehicle.get(v["id"], []):
                 # このセル(30分)と予約時間帯が重なるか
@@ -1200,7 +1225,7 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
 
 
 def page_reservation():
-    st.subheader("🚗 社用車の予約（タイムスケジュール 9:00〜17:30）")
+    st.subheader("🚗 社用車の予約（9:00〜。2月は20:00・3月は21:00まで）")
 
     vehicles = get_vehicles()
     if not vehicles:
@@ -1211,7 +1236,8 @@ def page_reservation():
     c1, c2 = st.columns(2)
     sel_date = c1.date_input("利用日", jst_today(), key="sched_date")
     vehicle = c2.selectbox("車両", vehicles, format_func=lambda v: f"{v['name']} {v['plate']}")
-    st.caption(f"{sel_date}（{WEEKDAY_JP[sel_date.weekday()]}）　区分：{day_status_label(sel_date)}")
+    st.caption(f"{sel_date}（{WEEKDAY_JP[sel_date.weekday()]}）　区分：{day_status_label(sel_date)}"
+               f"　予約可能：9:00〜{_min_to_hhmm(day_end_min_for(sel_date))}")
 
     # その日・その車両の既存予約（修正対象の選択に使う）
     with get_conn() as conn:
@@ -1239,8 +1265,13 @@ def page_reservation():
         def_yield = False
 
     # 対象を切り替えると初期値が入るよう、ウィジェットのkeyに対象IDを含める
+    # その日の可能時刻（2月は20:00・3月は21:00まで延長）
+    slots = time_slots_for(sel_date)
+    # 既存予約の時刻が範囲外にならないよう、初期値を可能範囲に収める
+    def_range = (def_range[0] if def_range[0] in slots else slots[0],
+                 def_range[1] if def_range[1] in slots else slots[-1])
     start_s, end_s = st.select_slider(
-        "予約する時間帯（両端をドラッグ）", options=TIME_SLOTS,
+        "予約する時間帯（両端をドラッグ）", options=slots,
         value=def_range, key=f"resv_range_{vehicle['id']}_{target_id}")
     c3, c4 = st.columns(2)
     # 利用者名は掃除当番の名簿（番号順）から選ぶ。名簿外の既存名も選べるよう先頭に残す
@@ -1367,8 +1398,8 @@ def page_reservation():
             "利用日": st.column_config.DateColumn("利用日", format="YYYY-MM-DD", required=True),
             "区分": st.column_config.TextColumn("区分", disabled=True),
             "車両": st.column_config.SelectboxColumn("車両", options=vehicle_names, required=True),
-            "開始": st.column_config.SelectboxColumn("開始", options=TIME_SLOTS[:-1], required=True),
-            "終了": st.column_config.SelectboxColumn("終了", options=TIME_SLOTS[1:], required=True),
+            "開始": st.column_config.SelectboxColumn("開始", options=TIME_SLOTS_MAX[:-1], required=True),
+            "終了": st.column_config.SelectboxColumn("終了", options=TIME_SLOTS_MAX[1:], required=True),
             "利用者名": st.column_config.SelectboxColumn("利用者名", options=user_options, required=True),
             "行き先": st.column_config.TextColumn("行き先"),
             "🔁譲れる": st.column_config.CheckboxColumn(
