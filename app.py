@@ -999,7 +999,7 @@ def page_calendar():
       .badge.work {{background:#2e7d32;}}
       .badge.off {{background:#c62828;}}
       .tl-scale {{position:relative; height:16px; font-size:12px; font-weight:normal; margin-top:3px;}}
-      .tl-scale span {{position:absolute; transform:translateX(-50%);}}
+      .tl-scale span {{position:absolute; transform:translateX(-50%); white-space:nowrap;}}
       .tl-scale span.half {{font-size:9px; color:#999;}}
       .tl {{position:relative;
             background:repeating-linear-gradient(to right,
