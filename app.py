@@ -937,15 +937,22 @@ def page_calendar():
     vehicle_color = {v["id"]: palette[i % len(palette)] for i, v in enumerate(all_vehicles)}
 
     # 予約列の上に表示する時間目盛り（30分刻み。正時は時刻、30分は小さく表示）
+    # 左端は左寄せ・右端は右寄せにして、9時などの文字が見切れないようにする
     scale = '<div class="tl-scale">'
     t = day_start_min
     while t <= day_end_min:
         left = (t - day_start_min) / total_min * 100
+        if t == day_start_min:
+            tf = "translateX(0)"          # 左端：左寄せ
+        elif t == day_end_min:
+            tf = "translateX(-100%)"      # 右端：右寄せ
+        else:
+            tf = "translateX(-50%)"       # 中間：中央寄せ
         hh, mm = divmod(t, 60)
         if mm == 0:
-            scale += f'<span style="left:{left:.2f}%;">{hh}時</span>'
+            scale += (f'<span style="left:{left:.2f}%; transform:{tf};">{hh}時</span>')
         else:
-            scale += f'<span class="half" style="left:{left:.2f}%;">30</span>'
+            scale += (f'<span class="half" style="left:{left:.2f}%; transform:{tf};">30</span>')
         t += 30
     scale += "</div>"
 
