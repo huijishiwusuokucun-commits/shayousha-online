@@ -28,9 +28,15 @@ import streamlit as st
 # バージョン情報（改修履歴）
 #   画面左のメニュー下部に表示される。改修したら必ずここに追記すること。
 # ============================================================
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.7.0"
 APP_UPDATED = "2026-08-12"
 CHANGELOG = [
+    ("1.7.0", "2026-08-12",
+     "直接編集の表に「✏️ 出勤/休」列を追加／"
+     "臨時休業・休日出勤を日ごとに手動で設定できるようにした（「自動」で元に戻る）"),
+    ("1.6.0", "2026-08-12",
+     "カレンダーで選べる年を「去年〜4年先」に拡大（2030年まで表示可能）／"
+     "年が変わると自動で1年ずつ繰り上がる"),
     ("1.5.0", "2026-08-12",
      "年末休暇を12月28日〜翌年1月4日に変更／"
      "クラウドDBへの接続を使い回して画面表示を高速化"),
@@ -346,7 +352,8 @@ def init_db():
                 duty TEXT,
                 event TEXT,
                 note TEXT,
-                duty_swap TEXT
+                duty_swap TEXT,
+                workday INTEGER
             );
             """
         )
@@ -369,6 +376,9 @@ def init_db():
             alters.append(("ALTER TABLE day_overrides ADD COLUMN note TEXT", ()))
         if "duty_swap" not in cols:
             alters.append(("ALTER TABLE day_overrides ADD COLUMN duty_swap TEXT", ()))
+        # 出勤／休を手動で変えた日を記録する列（NULL=自動判定 / 1=出勤 / 0=休）
+        if "workday" not in cols:
+            alters.append(("ALTER TABLE day_overrides ADD COLUMN workday INTEGER", ()))
         # 予約テーブルに「譲れる」フラグ列を追加（既存DB対応）
         if "transferable" not in rcols:
             alters.append(
@@ -500,8 +510,18 @@ def is_working_saturday(d: datetime.date) -> bool:
     return False
 
 
+def manual_workday(d: datetime.date):
+    """出勤／休を手動で変えた日なら True(出勤)/False(休)、変えていなければ None。
+    （カレンダーの直接編集で「出勤」「休」を選んだ日が対象）"""
+    return get_workday_overrides().get(d)
+
+
 def is_workday(d: datetime.date) -> bool:
-    """会社の出勤日かどうか（日曜・祝日・年末休暇・休みの土曜を除く）"""
+    """会社の出勤日かどうか（日曜・祝日・年末休暇・休みの土曜を除く）。
+    直接編集で手動指定された日は、その指定が自動判定より優先される。"""
+    ov = manual_workday(d)
+    if ov is not None:
+        return ov
     if is_newyear_closed(d):
         return False
     if _is_holiday(d):
@@ -526,6 +546,9 @@ def _esc(s) -> str:
 
 def day_status_label(d: datetime.date) -> str:
     """その日の区分を文字で返す（出勤／休（理由））"""
+    ov = manual_workday(d)
+    if ov is not None:                      # 手動指定はほかの理由より優先
+        return "出勤（手動）" if ov else "休（手動）"
     if is_newyear_closed(d):
         return "休（年末休暇）"
     hn = _holiday_name(d)
@@ -538,6 +561,11 @@ def day_status_label(d: datetime.date) -> str:
 
 # 掃除当番のローテーションから除外するメンバー（朝礼の輪番には影響しない）
 DUTY_EXCLUDED_NAMES = {"門脇", "平岡"}
+
+# 直接編集の表「✏️ 出勤/休」列の選択肢
+WORKDAY_CHOICE_AUTO = "自動"      # カレンダー規則どおり（上書きなし）
+WORKDAY_CHOICE_WORK = "🟢 出勤"   # 手動で出勤日にする（休日出勤など）
+WORKDAY_CHOICE_OFF = "🔴 休"      # 手動で休みにする（臨時休業など）
 
 # 直接編集の表：1行あたりの高さ（px）。
 # 全体の文字を16pxに拡大しているため、既定より広めに取らないと
@@ -659,36 +687,55 @@ def get_reservations_between(start: datetime.date, end: datetime.date):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_day_overrides(start: datetime.date, end: datetime.date):
-    """期間内の手入力上書き（掃除当番・朝礼・備考・入替）を
-    {date: {'duty':.., 'event':.., 'note':.., 'duty_swap':..}} で返す（キャッシュ）。
+    """期間内の手入力上書き（掃除当番・朝礼・備考・入替・出勤/休）を
+    {date: {'duty':.., 'event':.., 'note':.., 'duty_swap':.., 'workday':..}}
+    で返す（キャッシュ）。
     値が None のフィールドは『上書きなし（自動値を使う）』を意味する。"""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT date, duty, event, note, duty_swap FROM day_overrides "
+            "SELECT date, duty, event, note, duty_swap, workday FROM day_overrides "
             "WHERE date BETWEEN ? AND ?",
             (start.isoformat(), end.isoformat()),
         ).fetchall()
     return {datetime.date.fromisoformat(r["date"]):
             {"duty": r["duty"], "event": r["event"], "note": r["note"],
-             "duty_swap": r["duty_swap"]}
+             "duty_swap": r["duty_swap"], "workday": r["workday"]}
             for r in rows}
 
 
-def save_day_override(d: datetime.date, duty, event, note, duty_swap):
-    """1日分の上書きを保存する。各フィールドが None なら自動値に戻す。
-    すべて None なら行を削除する。"""
+@st.cache_data(ttl=600, show_spinner=False)
+def get_workday_overrides():
+    """出勤／休を手動で変えた日だけを {date: True(出勤)/False(休)} で返す。
+
+    掃除当番は「起算日から出勤日を数えて」割り当てるため、表示中の月だけでなく
+    起算日以降のすべての手動変更が必要になる。件数は多くならないので全件読む。"""
     with get_conn() as conn:
-        if duty is None and event is None and note is None and duty_swap is None:
+        rows = conn.execute(
+            "SELECT date, workday FROM day_overrides WHERE workday IS NOT NULL"
+        ).fetchall()
+    return {datetime.date.fromisoformat(r["date"]): bool(r["workday"]) for r in rows}
+
+
+def save_day_override(d: datetime.date, duty, event, note, duty_swap, workday=None):
+    """1日分の上書きを保存する。各フィールドが None なら自動値に戻す。
+    すべて None なら行を削除する。
+    workday は None=自動判定 / True(1)=出勤 / False(0)=休。"""
+    wd = None if workday is None else int(bool(workday))
+    with get_conn() as conn:
+        if (duty is None and event is None and note is None
+                and duty_swap is None and wd is None):
             conn.execute("DELETE FROM day_overrides WHERE date=?", (d.isoformat(),))
         else:
             conn.execute(
-                "INSERT INTO day_overrides(date, duty, event, note, duty_swap) "
-                "VALUES(?,?,?,?,?) "
+                "INSERT INTO day_overrides(date, duty, event, note, duty_swap, workday) "
+                "VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(date) DO UPDATE SET duty=excluded.duty, "
-                "event=excluded.event, note=excluded.note, duty_swap=excluded.duty_swap",
-                (d.isoformat(), duty, event, note, duty_swap),
+                "event=excluded.event, note=excluded.note, "
+                "duty_swap=excluded.duty_swap, workday=excluded.workday",
+                (d.isoformat(), duty, event, note, duty_swap, wd),
             )
     get_day_overrides.clear()
+    get_workday_overrides.clear()
 
 
 # ============================================================
@@ -702,7 +749,10 @@ def page_calendar():
     # 既定値をセッションに用意（リンク移動で当月へ戻らないよう key で保持する）
     st.session_state.setdefault("cal_year", today.year)
     st.session_state.setdefault("cal_month", today.month)
-    year = col1.selectbox("年", list(range(today.year - 1, today.year + 3)),
+    # 選べる年は「去年 〜 4年先」。今日の日付が基準なので、年が変わると
+    # 自動的に1年ずつ繰り上がる（手作業での延長は不要）。
+    #   例）2026年なら 2025〜2030年、2027年になれば 2026〜2031年
+    year = col1.selectbox("年", list(range(today.year - 1, today.year + 5)),
                           key="cal_year")
     month = col2.selectbox("月", list(range(1, 13)), key="cal_month")
 
@@ -758,7 +808,8 @@ def page_calendar():
                 if qc1.button("💾 保存", type="primary", key="quicknote_save"):
                     cu = overrides.get(en_date, {})
                     save_day_override(en_date, cu.get("duty"), cu.get("event"),
-                                      (new_note.strip() or None), cu.get("duty_swap"))
+                                      (new_note.strip() or None), cu.get("duty_swap"),
+                                      cu.get("workday"))
                     del st.session_state["editnote_date"]
                     st.rerun()
                 if qc2.button("閉じる", key="quicknote_close"):
@@ -795,7 +846,7 @@ def page_calendar():
                     cu = overrides.get(es_date, {})
                     val = None if new_swap == "（入替なし）" else new_swap
                     save_day_override(es_date, cu.get("duty"), cu.get("event"),
-                                      cu.get("note"), val)
+                                      cu.get("note"), val, cu.get("workday"))
                     del st.session_state["editswap_date"]
                     st.rerun()
                 if sc2.button("閉じる", key="quickswap_close"):
@@ -820,13 +871,17 @@ def page_calendar():
     # ------------------------------------------------------------
     def render_direct_editor():
         st.divider()
-        st.markdown("#### ✏️ 掃除当番・入替・朝礼当番・備考を直接編集")
+        st.markdown("#### ✏️ 出勤/休・掃除当番・入替・朝礼当番・備考を直接編集")
         st.caption("各マスをダブルクリックすると書き換えられます。"
+                   "「出勤/休」は臨時休業や休日出勤があるときに変更します"
+                   "（「自動」に戻すとカレンダー規則どおりの判定に戻ります）。"
                    "「掃除当番」を名簿のメンバー名に変えると、その日（その週）以降も名簿順で続きます。"
                    "「🔁入替」は当番を交代したい日に交代後の人を入力します（その日だけ差し替え／"
                    "ローテーション自体は変わりません）。"
                    "空欄にすると自動の割り当てに戻ります（備考・入替は空欄で消去）。"
                    "編集後は「💾 保存」を押してください。")
+        st.caption("⚠️ 出勤/休を変えると、掃除当番は出勤日を数えて割り当てているため、"
+                   "その日以降の当番の順番がずれます。朝礼が休みの日に当たる場合は翌出勤日へ移ります。")
 
         rows_data = []
         d = first
@@ -835,6 +890,8 @@ def page_calendar():
                 "date": d.isoformat(),
                 "日付": f"{d.month}/{d.day}（{WEEKDAY_JP[d.weekday()]}）",
                 "区分": status_text(d),
+                "✏️ 出勤/休": WORKDAY_CHOICE_AUTO if manual_workday(d) is None else (
+                    WORKDAY_CHOICE_WORK if manual_workday(d) else WORKDAY_CHOICE_OFF),
                 "🧹 掃除当番": eff_duty(d),
                 "🔁 入替": eff_swap(d),
                 "📌 朝礼当番": eff_event(d),
@@ -844,6 +901,8 @@ def page_calendar():
         cal_df = pd.DataFrame(rows_data)
 
         swap_help = "当番を交代する日に、交代後の人を入力（名簿の人を選ぶと確実です）"
+        work_help = ("臨時の休みや休日出勤を設定します。"
+                     "「自動」＝日曜・祝日・年末休暇・土曜ルールによる通常の判定")
         editor_key = f"cal_editor_{year}_{month:02d}"   # 月ごとに独立したキー
         try:
             edited_cal = st.data_editor(
@@ -855,6 +914,10 @@ def page_calendar():
                     "date": None,
                     "日付": st.column_config.TextColumn("日付", disabled=True),
                     "区分": st.column_config.TextColumn("区分", disabled=True),
+                    "✏️ 出勤/休": st.column_config.SelectboxColumn(
+                        "✏️ 出勤/休", help=work_help, required=True,
+                        options=[WORKDAY_CHOICE_AUTO, WORKDAY_CHOICE_WORK,
+                                 WORKDAY_CHOICE_OFF]),
                     "🧹 掃除当番": st.column_config.TextColumn("🧹 掃除当番"),
                     "🔁 入替": st.column_config.TextColumn("🔁 入替", help=swap_help),
                     "📌 朝礼当番": st.column_config.TextColumn("📌 朝礼当番"),
@@ -879,16 +942,20 @@ def page_calendar():
                     new_s = _cell_str(row["🔁 入替"])
                     new_e = _cell_str(row["📌 朝礼当番"])
                     new_n = _cell_str(row["📝 備考"])
+                    new_w = _cell_str(row["✏️ 出勤/休"])
                     duty_changed = new_d != _cell_str(orig["🧹 掃除当番"])
                     swap_changed = new_s != _cell_str(orig["🔁 入替"])
                     event_changed = new_e != _cell_str(orig["📌 朝礼当番"])
                     note_changed = new_n != _cell_str(orig["📝 備考"])
-                    if not (duty_changed or swap_changed or event_changed or note_changed):
+                    work_changed = new_w != _cell_str(orig["✏️ 出勤/休"])
+                    if not (duty_changed or swap_changed or event_changed
+                            or note_changed or work_changed):
                         continue
-                    cur = stored.get(d, {"duty": None, "event": None,
-                                         "note": None, "duty_swap": None})
+                    cur = stored.get(d, {"duty": None, "event": None, "note": None,
+                                         "duty_swap": None, "workday": None})
                     duty_ov, event_ov = cur["duty"], cur["event"]
                     note_ov, swap_ov = cur["note"], cur["duty_swap"]
+                    work_ov = cur["workday"]
                     if duty_changed:
                         duty_ov = None if new_d == "" else new_d
                     if swap_changed:
@@ -897,7 +964,14 @@ def page_calendar():
                         event_ov = None if new_e == "" else new_e
                     if note_changed:
                         note_ov = None if new_n == "" else new_n
-                    save_day_override(d, duty_ov, event_ov, note_ov, swap_ov)
+                    if work_changed:
+                        if new_w == WORKDAY_CHOICE_WORK:
+                            work_ov = 1
+                        elif new_w == WORKDAY_CHOICE_OFF:
+                            work_ov = 0
+                        else:                       # 「自動」＝上書きを消す
+                            work_ov = None
+                    save_day_override(d, duty_ov, event_ov, note_ov, swap_ov, work_ov)
                 st.success("カレンダーの変更を保存しました。")
                 st.rerun()
             except Exception as e:
@@ -943,7 +1017,11 @@ def page_calendar():
             iso = d.isoformat()
             qs = f"&y={year}&m={month}"   # 表示中の年月を引き継ぐ
 
-            if newyear:
+            manual = manual_workday(d)
+            if manual is not None:      # 手動指定は年末休暇・祝日より優先して表示
+                badge = ('<span class="badge work">出勤（手動）</span>' if manual
+                         else '<span class="badge off">休（手動）</span>')
+            elif newyear:
                 badge = '<span class="badge off">年末休暇</span>'
             elif hname:
                 badge = f'<span class="badge off">{hname}</span>'
@@ -1115,7 +1193,11 @@ def page_calendar():
         if d == today:
             date_cls = (date_cls + " todaydate").strip()
         date_label = f'<span class="{date_cls}">{d.month}/{d.day}（{WEEKDAY_JP[wd]}）</span>'
-        if newyear:
+        manual = manual_workday(d)
+        if manual is not None:          # 手動指定は年末休暇・祝日より優先して表示
+            date_label += ('<span class="badge work">出勤</span>' if manual
+                           else '<span class="badge off">休</span>')
+        elif newyear:
             date_label += '<span class="badge off">年末休暇</span>'
         elif holiday_name:
             date_label += f'<br><span class="red" style="font-size:11px;">{holiday_name}</span>'
@@ -1182,6 +1264,7 @@ def page_calendar():
             for v in all_vehicles)
         st.markdown(legend, unsafe_allow_html=True)
     st.caption("🟢出勤＝会社の出勤日　🔴休＝休み（日曜・祝日・年末休暇・休みの土曜）"
+               "※下の編集表の「✏️ 出勤/休」で、臨時休業や休日出勤を手動で設定できます。"
                "🚗＝車両予約（バーにマウスを乗せると詳細表示／🔁赤色＝他の人に譲れる予約）。"
                "👉 **時間帯の列をクリック**すると、その日の車両予約画面へ移動します。"
                "👉 **入替の列をクリック**すると、その日の掃除当番の交代を入力できます。"
@@ -1785,7 +1868,7 @@ def main():
             y, m = int(qp.get("y")), int(qp.get("m"))
         except (TypeError, ValueError):
             return
-        if (today.year - 1) <= y <= (today.year + 2):
+        if (today.year - 1) <= y <= (today.year + 4):   # 年の選択肢と同じ範囲
             st.session_state["cal_year"] = y
         if 1 <= m <= 12:
             st.session_state["cal_month"] = m
