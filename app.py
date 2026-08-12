@@ -28,9 +28,12 @@ import streamlit as st
 # バージョン情報（改修履歴）
 #   画面左のメニュー下部に表示される。改修したら必ずここに追記すること。
 # ============================================================
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 APP_UPDATED = "2026-08-12"
 CHANGELOG = [
+    ("1.7.1", "2026-08-12",
+     "「no such column: workday」エラーを修正／"
+     "コード更新時にデータベースの更新が確実に実行されるようにした"),
     ("1.7.0", "2026-08-12",
      "直接編集の表に「✏️ 出勤/休」列を追加／"
      "臨時休業・休日出勤を日ごとに手動で設定できるようにした（「自動」で元に戻る）"),
@@ -53,6 +56,15 @@ CHANGELOG = [
     ("1.0.0", "2026-06-24",
      "オンライン版として公開（JST判定・掃除当番の入替列を追加）"),
 ]
+
+# ============================================================
+# データベースのスキーマ版数
+#   テーブルや列を追加・変更したら【必ず】この番号を1つ上げること。
+#   番号を上げないと、コード更新後もマイグレーションが実行されず
+#   「no such column: ○○」というエラーになる（下の _init_db_once を参照）。
+#     2 … day_overrides に workday 列（出勤/休の手動指定）を追加
+# ============================================================
+DB_SCHEMA_VERSION = 2
 
 # ============================================================
 # 基本設定
@@ -1821,17 +1833,22 @@ def require_login():
 # メイン
 # ============================================================
 @st.cache_resource(show_spinner=False)
-def _init_db_once():
+def _init_db_once(schema_version: int):
     """テーブル作成・マイグレーションはアプリ起動後1回だけ実行する。
     以前は利用者ごと（ブラウザのセッションごと）に走っていたため、
-    人が開くたびにDBへの往復が発生して最初の表示が遅くなっていた。"""
+    人が開くたびにDBへの往復が発生して最初の表示が遅くなっていた。
+
+    schema_version を引数に取るのは重要。Streamlit はコードを更新しても
+    プロセスを再起動せずスクリプトだけ読み直すことがあり、その場合
+    st.cache_resource の中身が残るためマイグレーションが実行されない。
+    版数が変わればキャッシュのキーも変わり、確実に実行される。"""
     init_db()
     return True
 
 
 def main():
     try:
-        _init_db_once()
+        _init_db_once(DB_SCHEMA_VERSION)
     except Exception as e:
         st.error("データ保存先への接続に失敗しました。"
                  "Turso をお使いの場合は接続情報（URL・トークン）をご確認ください。")
@@ -1935,6 +1952,19 @@ def main():
         elif page == "⚙️ 設定":
             page_settings()
     except Exception as e:
+        # 「no such column: ○○」＝ DBに列が足りない（マイグレーション未実行）。
+        # スキーマ版数の上げ忘れなどで起きるため、1度だけ作り直して自動で復旧する。
+        if "no such column" in str(e) and not st.session_state.get("_db_remigrated"):
+            st.session_state["_db_remigrated"] = True
+            try:
+                _init_db_once.clear()
+                _init_db_once(DB_SCHEMA_VERSION)
+                get_day_overrides.clear()
+                get_workday_overrides.clear()
+                st.rerun()
+            except Exception as e2:
+                st.error(f"データベースの更新に失敗しました: {e2}")
+                return
         st.error(f"エラーが発生しました: {e}")
 
 
