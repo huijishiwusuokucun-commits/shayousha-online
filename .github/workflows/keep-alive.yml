@@ -1,0 +1,61 @@
+# ============================================================
+#  アプリを眠らせないための定期アクセス
+#
+#  Streamlit Community Cloud（無料）は、しばらくアクセスがないと
+#  アプリを停止する。次に誰かが開いたとき起動からやり直しになるため、
+#  朝いちばんの表示が遅くなる。
+#  この設定は定期的にアプリへ通信して「使われている」状態を保つ。
+#
+#  ・このリポジトリは公開設定のため、GitHub Actions の利用料は無料。
+#  ・手動で試したいときは GitHub の Actions タブ →「アプリを眠らせない」
+#    →「Run workflow」で実行できる。
+# ============================================================
+name: アプリを眠らせない
+
+on:
+  schedule:
+    # 時刻はすべて UTC（日本時間より9時間前）で書く必要がある。
+    # 日本時間 06:00〜21:59 の間、15分おき
+    - cron: "*/15 21-23,0-12 * * *"
+    # 夜間（日本時間 22:00 / 00:00 / 02:00 / 04:00）にも念のため
+    - cron: "0 13,15,17,19 * * *"
+  workflow_dispatch: # 手動実行用
+
+# 前回の実行が終わっていなければ、重ねて動かさない
+concurrency:
+  group: keep-alive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: アプリにアクセスする
+        env:
+          APP_URL: https://shayousha-online-beryykkjuehwpso2wexuta.streamlit.app
+        run: |
+          set -uo pipefail
+
+          # 動作確認用のエンドポイント。認証なしで {"status":"ok"} が返る。
+          # -L（リダイレクト追従）は付けない。アプリのトップは認証用URLへ
+          # 転送され、curl だけだと転送が延々と続いてしまうため。
+          for i in 1 2 3; do
+            code=$(curl -sS -o /tmp/health.txt -w "%{http_code}" \
+                     --max-time 60 "$APP_URL/healthz" || echo "000")
+            echo "[$i回目] /healthz -> HTTP $code  $(cat /tmp/health.txt 2>/dev/null | head -c 100)"
+            if [ "$code" = "200" ]; then
+              echo "アプリは起きています。"
+              break
+            fi
+            if [ "$i" = "3" ]; then
+              echo "::warning::3回試しましたが応答が 200 になりませんでした（最後の応答: $code）"
+              exit 0   # 失敗通知メールを出さないため、ここでは異常終了にしない
+            fi
+            sleep 20
+          done
+
+          # トップページにも1回だけ触れておく（転送は追わない）
+          top=$(curl -sS -o /dev/null -w "%{http_code}" \
+                  --max-time 60 "$APP_URL/" || echo "000")
+          echo "トップページ -> HTTP $top （303 は認証用URLへの転送で、異常ではありません）"
