@@ -14,6 +14,7 @@
 import base64
 import calendar
 import datetime
+import functools
 import json
 import os
 import sqlite3
@@ -27,9 +28,12 @@ import streamlit as st
 # バージョン情報（改修履歴）
 #   画面左のメニュー下部に表示される。改修したら必ずここに追記すること。
 # ============================================================
-APP_VERSION = "1.4.0"
-APP_UPDATED = "2026-08-06"
+APP_VERSION = "1.5.0"
+APP_UPDATED = "2026-08-12"
 CHANGELOG = [
+    ("1.5.0", "2026-08-12",
+     "年末休暇を12月28日〜翌年1月4日に変更／"
+     "クラウドDBへの接続を使い回して画面表示を高速化"),
     ("1.4.0", "2026-08-06",
      "月間カレンダーの見出し行（日付・車両予約の時間目盛り）と日付列を固定／"
      "1日〜月末までを表の中でスクロールして全部見られるように変更"),
@@ -154,8 +158,13 @@ class TursoConn:
         import requests  # 遅延import（ローカルSQLite利用時は読み込まない）
         self._requests = requests
         self._endpoint = _turso_endpoint(url)
-        self._headers = {"Authorization": f"Bearer {token}",
-                         "Content-Type": "application/json"}
+        # Session を使って通信路を使い回す。
+        # 毎回 requests.post() だと1クエリごとに TCP＋TLS の接続確立が発生し、
+        # 東京のDBでも1回あたり0.2〜0.4秒かかる。Session なら2回目以降は
+        # 接続を再利用（keep-alive）するのでこの待ち時間がなくなる。
+        self._session = requests.Session()
+        self._session.headers.update({"Authorization": f"Bearer {token}",
+                                      "Content-Type": "application/json"})
 
     @staticmethod
     def _arg(v):
@@ -188,8 +197,8 @@ class TursoConn:
         return raw  # text
 
     def _pipeline(self, requests_list):
-        resp = self._requests.post(
-            self._endpoint, headers=self._headers,
+        resp = self._session.post(
+            self._endpoint,
             data=json.dumps({"requests": requests_list}), timeout=30)
         if resp.status_code >= 400:
             # サーバーの具体的な理由を読めるようにする
@@ -214,13 +223,41 @@ class TursoConn:
         return _TursoCursor(cols, rows)
 
     def executescript(self, script):
-        # Tursoは1回のpipelineに複数SQLをまとめると400を返すことがあるため、
-        # 1文ずつ確実に送る。
         stmts = [s.strip() for s in script.split(";") if s.strip()]
-        for s in stmts:
-            self._pipeline([{"type": "execute", "stmt": {"sql": s}},
-                            {"type": "close"}])
+        if not stmts:
+            return _TursoCursor([], [])
+        # まず全部を1回の通信でまとめて送る（テーブル作成6本＝6往復 → 1往復）。
+        # 1つのSQL文ずつ別リクエストとして並べるので、複数SQLを1文に
+        # 詰め込んだとき（Tursoが400を返す）とは別物。
+        try:
+            self._pipeline([{"type": "execute", "stmt": {"sql": s}} for s in stmts]
+                           + [{"type": "close"}])
+        except Exception:
+            # 万一まとめ送りが拒否された場合は、従来どおり1文ずつ送り直す。
+            for s in stmts:
+                self._pipeline([{"type": "execute", "stmt": {"sql": s}},
+                                {"type": "close"}])
         return _TursoCursor([], [])
+
+    def execute_batch(self, statements):
+        """(sql, params) のリストを1回の通信でまとめて実行する。
+        往復回数を減らしたい初期化処理などで使う。"""
+        reqs = []
+        for sql, params in statements:
+            stmt = {"sql": sql}
+            if params:
+                stmt["args"] = [self._arg(p) for p in params]
+            reqs.append({"type": "execute", "stmt": stmt})
+        if not reqs:
+            return []
+        data = self._pipeline(reqs + [{"type": "close"}])
+        out = []
+        for res in data.get("results", [])[:len(reqs)]:
+            result = res.get("response", {}).get("result", {})
+            cols = [c.get("name") for c in result.get("cols", [])]
+            rows = [[self._val(cell) for cell in row] for row in result.get("rows", [])]
+            out.append(_TursoCursor(cols, rows))
+        return out
 
     def commit(self):
         pass  # 1文ごとに自動コミット
@@ -241,11 +278,18 @@ class TursoConn:
 # ============================================================
 # データベース接続
 # ============================================================
+@st.cache_resource(show_spinner=False)
+def _shared_turso_conn(url, token):
+    """Turso接続はアプリ全体で1つだけ作って使い回す。
+    毎回作り直すと接続確立のやり直しになり、画面表示が目に見えて遅くなる。"""
+    return TursoConn(url, token)
+
+
 def get_conn():
     """保存先への接続を返す。Turso設定があればTurso、無ければローカルSQLite。"""
     url, token = _turso_config()
     if url and token:
-        return TursoConn(url, token)
+        return _shared_turso_conn(url, token)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -306,24 +350,45 @@ def init_db():
             );
             """
         )
+        batch = getattr(conn, "execute_batch", None)   # Turso のときだけ使える
+
         # 既存DBに不足列があれば追加する（マイグレーション）
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(day_overrides)").fetchall()]
+        # 2つのPRAGMAはまとめて1往復で取得する
+        pragmas = [("PRAGMA table_info(day_overrides)", ()),
+                   ("PRAGMA table_info(reservations)", ())]
+        if batch:
+            cur_do, cur_rv = batch(pragmas)
+        else:
+            cur_do = conn.execute(pragmas[0][0])
+            cur_rv = conn.execute(pragmas[1][0])
+        cols = [r[1] for r in cur_do.fetchall()]
+        rcols = [r[1] for r in cur_rv.fetchall()]
+
+        alters = []
         if "note" not in cols:
-            conn.execute("ALTER TABLE day_overrides ADD COLUMN note TEXT")
+            alters.append(("ALTER TABLE day_overrides ADD COLUMN note TEXT", ()))
         if "duty_swap" not in cols:
-            conn.execute("ALTER TABLE day_overrides ADD COLUMN duty_swap TEXT")
+            alters.append(("ALTER TABLE day_overrides ADD COLUMN duty_swap TEXT", ()))
         # 予約テーブルに「譲れる」フラグ列を追加（既存DB対応）
-        rcols = [r[1] for r in conn.execute("PRAGMA table_info(reservations)").fetchall()]
         if "transferable" not in rcols:
-            conn.execute("ALTER TABLE reservations ADD COLUMN transferable INTEGER DEFAULT 0")
+            alters.append(
+                ("ALTER TABLE reservations ADD COLUMN transferable INTEGER DEFAULT 0", ()))
+
         # 設定の初期値（既にあれば上書きしない）
         defaults = {
             "weekly_event_name": "朝礼",           # 名前は設定画面で変更可能
             "rotation_base_date": "2026-01-05",    # 掃除当番ローテーションの起算日
             "weekly_event_rotation": "1",          # 朝礼を週替わり当番制にするか（0/1）
         }
-        for k, v in defaults.items():
-            conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v))
+        writes = alters + [
+            ("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v))
+            for k, v in defaults.items()
+        ]
+        if batch:
+            batch(writes)                          # まとめて1往復
+        else:
+            for sql, params in writes:
+                conn.execute(sql, params)
 
 
 # ------------------------------------------------------------
@@ -392,9 +457,23 @@ def _saturday_of_week_containing(target: datetime.date) -> datetime.date:
     return target + datetime.timedelta(days=(5 - target.weekday()))
 
 
+@functools.lru_cache(maxsize=8192)
+def _holiday_name(d: datetime.date):
+    """祝日名を返す（祝日でなければ None）。
+    jpholiday の判定は1回あたり0.09ミリ秒ほどかかる。掃除当番の割り当てでは
+    起算日から今月末まで1日ずつなぞるため数百回呼ばれ、画面を開くたびに
+    その分待たされる。一度調べた日は覚えておいて使い回す。"""
+    return jpholiday.is_holiday_name(d)
+
+
+def _is_holiday(d: datetime.date) -> bool:
+    """祝日かどうか（_holiday_name のキャッシュを共用）"""
+    return _holiday_name(d) is not None
+
+
 def is_newyear_closed(d: datetime.date) -> bool:
-    """1月1日〜5日は事務所休み"""
-    return d.month == 1 and d.day <= 5
+    """12月28日〜翌年1月4日は年末休暇（事務所休み）"""
+    return (d.month == 12 and d.day >= 28) or (d.month == 1 and d.day <= 4)
 
 
 def is_working_saturday(d: datetime.date) -> bool:
@@ -422,10 +501,10 @@ def is_working_saturday(d: datetime.date) -> bool:
 
 
 def is_workday(d: datetime.date) -> bool:
-    """会社の出勤日かどうか（日曜・祝日・年始休み・休みの土曜を除く）"""
+    """会社の出勤日かどうか（日曜・祝日・年末休暇・休みの土曜を除く）"""
     if is_newyear_closed(d):
         return False
-    if jpholiday.is_holiday(d):
+    if _is_holiday(d):
         return False
     wd = d.weekday()
     if wd == 6:          # 日曜は休み
@@ -448,8 +527,8 @@ def _esc(s) -> str:
 def day_status_label(d: datetime.date) -> str:
     """その日の区分を文字で返す（出勤／休（理由））"""
     if is_newyear_closed(d):
-        return "休（事務所休み）"
-    hn = jpholiday.is_holiday_name(d)
+        return "休（年末休暇）"
+    hn = _holiday_name(d)
     if hn:
         return f"休（{hn}）"
     if not is_workday(d):
@@ -853,7 +932,7 @@ def page_calendar():
             wd = d.weekday()
             workday = is_workday(d)
             newyear = is_newyear_closed(d)
-            hname = jpholiday.is_holiday_name(d)
+            hname = _holiday_name(d)
             cls = []
             if not workday:
                 cls.append("hol")
@@ -865,7 +944,7 @@ def page_calendar():
             qs = f"&y={year}&m={month}"   # 表示中の年月を引き継ぐ
 
             if newyear:
-                badge = '<span class="badge off">事務所休み</span>'
+                badge = '<span class="badge off">年末休暇</span>'
             elif hname:
                 badge = f'<span class="badge off">{hname}</span>'
             elif workday:
@@ -1020,7 +1099,7 @@ def page_calendar():
     d = first
     while d <= last:
         wd = d.weekday()
-        holiday_name = jpholiday.is_holiday_name(d)
+        holiday_name = _holiday_name(d)
         workday = is_workday(d)
         newyear = is_newyear_closed(d)
 
@@ -1037,7 +1116,7 @@ def page_calendar():
             date_cls = (date_cls + " todaydate").strip()
         date_label = f'<span class="{date_cls}">{d.month}/{d.day}（{WEEKDAY_JP[wd]}）</span>'
         if newyear:
-            date_label += '<span class="badge off">事務所休み</span>'
+            date_label += '<span class="badge off">年末休暇</span>'
         elif holiday_name:
             date_label += f'<br><span class="red" style="font-size:11px;">{holiday_name}</span>'
         elif wd == 5:
@@ -1102,7 +1181,7 @@ def page_calendar():
             f'border-radius:3px; padding:1px 6px; font-size:12px;">{v["name"]}</span>'
             for v in all_vehicles)
         st.markdown(legend, unsafe_allow_html=True)
-    st.caption("🟢出勤＝会社の出勤日　🔴休＝休み（日曜・祝日・年始・休みの土曜）　"
+    st.caption("🟢出勤＝会社の出勤日　🔴休＝休み（日曜・祝日・年末休暇・休みの土曜）"
                "🚗＝車両予約（バーにマウスを乗せると詳細表示／🔁赤色＝他の人に譲れる予約）。"
                "👉 **時間帯の列をクリック**すると、その日の車両予約画面へ移動します。"
                "👉 **入替の列をクリック**すると、その日の掃除当番の交代を入力できます。"
@@ -1658,18 +1737,23 @@ def require_login():
 # ============================================================
 # メイン
 # ============================================================
+@st.cache_resource(show_spinner=False)
+def _init_db_once():
+    """テーブル作成・マイグレーションはアプリ起動後1回だけ実行する。
+    以前は利用者ごと（ブラウザのセッションごと）に走っていたため、
+    人が開くたびにDBへの往復が発生して最初の表示が遅くなっていた。"""
+    init_db()
+    return True
+
+
 def main():
-    # 初期化（テーブル作成・マイグレーション）はセッション中に1回だけ
-    # （Turso利用時の通信回数を減らすため）
-    if not st.session_state.get("_db_inited"):
-        try:
-            init_db()
-            st.session_state["_db_inited"] = True
-        except Exception as e:
-            st.error("データ保存先への接続に失敗しました。"
-                     "Turso をお使いの場合は接続情報（URL・トークン）をご確認ください。")
-            st.exception(e)
-            st.stop()
+    try:
+        _init_db_once()
+    except Exception as e:
+        st.error("データ保存先への接続に失敗しました。"
+                 "Turso をお使いの場合は接続情報（URL・トークン）をご確認ください。")
+        st.exception(e)
+        st.stop()
     # パスワード認証は廃止（URLを知っていれば誰でも利用可）。
     # 再度パスワードで保護したくなったら、次行のコメントを外してください。
     # require_login()
@@ -1744,7 +1828,7 @@ def main():
         st.divider()
         today = jst_today()
         st.caption(f"今日：{today}（{WEEKDAY_JP[today.weekday()]}）")
-        h = jpholiday.is_holiday_name(today)
+        h = _holiday_name(today)
         if h:
             st.caption(f"本日は祝日（{h}）です")
         # データ保存先の表示（Turso接続の確認用）
