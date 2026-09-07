@@ -28,9 +28,13 @@ import streamlit as st
 # バージョン情報（改修履歴）
 #   画面左のメニュー下部に表示される。改修したら必ずここに追記すること。
 # ============================================================
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 APP_UPDATED = "2026-09-07"
 CHANGELOG = [
+    ("1.9.0", "2026-09-07",
+     "予約済みの時間帯をクリックすると、その予約を選んだ状態で予約画面が開くように変更"
+     "（そのまま黄色の「🗑 この予約を取消」ボタンで取消せる）／"
+     "カレンダーの予約バー・スマホ表示の予約・時間帯の表のマスすべてに対応"),
     ("1.8.0", "2026-09-07",
      "予約時間を15分刻みに変更（タイムスケジュール表も15分刻み・正時に区切り線）／"
      "「🗑 この予約を取消」ボタンを黄色に変更／"
@@ -1058,6 +1062,9 @@ def page_calendar():
                     if r.get("transferable"):
                         t = (f'<span style="color:#d00; font-weight:bold;">🔁{t}'
                              f'（譲れます）</span>')
+                    # 予約をタップすると、その予約を選んだ状態（取消できる状態）で予約画面へ
+                    t = (f'<a href="?nav=resv&date={iso}&rid={r["id"]}{qs}" target="_self">'
+                         f'{t}</a> <span style="font-size:13px; color:#888;">［変更・取消］</span>')
                     items.append(t)
                 resv_html = ("<br>".join(items)
                              + f' <a href="?nav=resv&date={iso}{qs}" target="_self">［予約変更］</a>')
@@ -1180,6 +1187,12 @@ def page_calendar():
       .tl-bar {{position:absolute; height:26px; border-radius:3px; color:#fff;
                font-size:18px; line-height:26px; padding:0 4px; overflow:hidden;
                white-space:nowrap;}}
+      /* 予約バー自体がリンク。クリックするとその予約を選んだ状態で予約画面へ移動する */
+      a.tl-bar {{text-decoration:none; color:#fff; cursor:pointer; z-index:2;}}
+      a.tl-bar:hover {{outline:2px solid #ffd54f; filter:brightness(1.1);}}
+      /* バーのない余白部分＝新規予約用のリンク（バーの下に敷く） */
+      a.tlbg {{position:absolute; top:0; left:0; right:0; bottom:0; z-index:1;}}
+      a.tlbg:hover {{outline:2px solid #4caf50;}}
     </style>
     <div class="vcal-wrap">
     <table class="vcal">
@@ -1242,17 +1255,21 @@ def page_calendar():
             title_txt = (f'{r["vehicle_name"]} {r["start_time"]}-{r["end_time"]} '
                          f'{r["user_name"]} {r["purpose"]}'
                          + ("（他の人に譲れます）" if yieldable else ""))
-            bars += (f'<div class="tl-bar" style="left:{left:.2f}%; width:{width:.2f}%; '
+            # 予約バー＝クリックするとその予約を選んだ状態（取消できる状態）で予約画面へ
+            bars += (f'<a class="tl-bar" '
+                     f'href="?nav=resv&date={d.isoformat()}&rid={r["id"]}'
+                     f'&y={year}&m={month}" target="_self" '
+                     f'style="left:{left:.2f}%; width:{width:.2f}%; '
                      f'top:{j * 28 + 2}px; background:{color};" '
-                     f'title="{title_txt}">'
-                     f'{label_txt}</div>')
+                     f'title="{title_txt}／クリックで変更・取消">'
+                     f'{label_txt}</a>')
         height = max(len(day_resv) * 28 + 4, 30)
         iso = d.isoformat()
         qs = f"&y={year}&m={month}"   # 表示中の年月を引き継ぐ（当月へ戻るのを防ぐ）
-        # 時間帯セル＝クリックで車両予約画面へ移動するリンク
-        resv_cell = (f'<a class="resvlink" href="?nav=resv&date={iso}{qs}" target="_self" '
-                     f'title="クリックで予約画面へ">'
-                     f'<div class="tl" style="height:{height}px;">{bars}</div></a>')
+        # 時間帯セル：予約バーは「その予約の変更・取消」、余白は「新規予約」へのリンク
+        resv_cell = (f'<td><div class="tl" style="height:{height}px;">'
+                     f'<a class="tlbg" href="?nav=resv&date={iso}{qs}" target="_self" '
+                     f'title="クリックで新規予約"></a>{bars}</div></td>')
 
         ed, ee, en, es = eff_duty(d), eff_event(d), eff_note(d), eff_swap(d)
         duty_cell = f'<span class="duty">{ed}</span>' if ed else ""
@@ -1267,7 +1284,7 @@ def page_calendar():
         note_cell = (f'<a class="notelink" href="?nav=note&date={iso}{qs}" target="_self" '
                      f'title="クリックで備考を入力">{note_inner}</a>')
         html += (f'<tr class="{" ".join(row_cls)}"><td class="dcell">{date_label}</td>'
-                 f'<td>{resv_cell}</td><td>{duty_cell}</td><td>{swap_cell}</td>'
+                 f'{resv_cell}<td>{duty_cell}</td><td>{swap_cell}</td>'
                  f'<td>{event_cell}</td><td>{note_cell}</td></tr>')
         d += datetime.timedelta(days=1)
     html += "</table></div>"
@@ -1364,6 +1381,10 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
       td.select {background:#a5d6a7;}
       td.conflict {background:#ef9a9a;}
       td.free {background:#fff;}
+      /* 予約済みのマス＝クリックでその予約を選択（変更・取消できる状態）にする */
+      table.sched td a.pick {display:block; height:32px; line-height:32px;
+                             color:inherit; text-decoration:none; cursor:pointer;}
+      table.sched td a.pick:hover {outline:2px solid #ffd54f;}
     </style>
     <table class="sched"><tr><th style="width:120px;">車両</th>"""
     for s in slot_starts:
@@ -1389,16 +1410,21 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
             selected = (preview_range and v["id"] == preview_vehicle_id
                         and pv_start <= s and slot_end <= pv_end)
             hour_cls = " hour" if s.endswith(":00") else ""
+            if hit:
+                # クリックでその予約を選択（＝取消・変更できる状態）にするリンク
+                link = (f'?nav=resv&date={date.isoformat()}&rid={hit["id"]}')
             if hit and selected:
                 html += (f'<td class="conflict{hour_cls}" title="重複：{hit["start_time"]}-'
-                         f'{hit["end_time"]} {hit["user_name"]}">×</td>')
+                         f'{hit["end_time"]} {hit["user_name"]}／クリックで変更・取消">'
+                         f'<a class="pick" href="{link}" target="_self">×</a></td>')
             elif hit:
                 text = hit["user_name"] if hit["start_time"] == s or i == 0 else ""
                 cls = "yield" if hit.get("transferable") else "booked"
                 ymark = "（譲れます）" if hit.get("transferable") else ""
                 html += (f'<td class="{cls}{hour_cls}" '
                          f'title="{hit["start_time"]}-{hit["end_time"]} '
-                         f'{hit["user_name"]} {hit["purpose"]}{ymark}">{text}</td>')
+                         f'{hit["user_name"]} {hit["purpose"]}{ymark}／クリックで変更・取消">'
+                         f'<a class="pick" href="{link}" target="_self">{text}</a></td>')
             elif selected:
                 html += f'<td class="select{hour_cls}"></td>'
             else:
@@ -1412,10 +1438,11 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
             txt = (f'🚗 {_esc(r["vehicle_name"])} {r["start_time"]}-{r["end_time"]} '
                    f'{_esc(r["user_name"])} {_esc(r["purpose"])}')
             if r["transferable"]:
-                parts.append(f'<span style="color:#d00; font-weight:bold;">{txt}'
-                             f'（🔁譲れます）</span>')
-            else:
-                parts.append(txt)
+                txt = (f'<span style="color:#d00; font-weight:bold;">{txt}'
+                       f'（🔁譲れます）</span>')
+            # クリックでその予約を選択（変更・取消）できるようにする
+            parts.append(f'<a href="?nav=resv&date={date.isoformat()}&rid={r["id"]}" '
+                         f'target="_self" style="color:inherit;">{txt}</a>')
         st.markdown('<div style="font-size:13px; color:#666;">'
                     + "　".join(parts) + "</div>", unsafe_allow_html=True)
 
@@ -1428,10 +1455,30 @@ def page_reservation():
         st.warning("車両が未登録です。「🚙 車両管理」画面で先に登録してください。")
         return
 
+    # カレンダーや時間帯の表で「予約をクリック」して来たときは、
+    # その予約の日付・車両に画面を合わせ、下の「予約操作対象」でも選択状態にする。
+    open_id = st.session_state.pop("_open_resv_id", None)
+    want_target_id = None
+    if open_id is not None:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM reservations WHERE id=?", (open_id,)).fetchone()
+        if row:
+            st.session_state["sched_date"] = datetime.date.fromisoformat(row["date"])
+            for v in vehicles:
+                if v["id"] == row["vehicle_id"]:
+                    st.session_state["resv_vehicle"] = v   # 車両も合わせる
+                    break
+            want_target_id = open_id
+            st.session_state["_opened_by_click"] = True
+        else:
+            st.info("その予約は既に取消されています。")
+
     st.markdown("#### 予約の追加・修正：時間帯はスライダーで調整（15分刻み）")
     c1, c2 = st.columns(2)
     sel_date = c1.date_input("利用日", jst_today(), key="sched_date")
-    vehicle = c2.selectbox("車両", vehicles, format_func=lambda v: f"{v['name']} {v['plate']}")
+    vehicle = c2.selectbox("車両", vehicles, key="resv_vehicle",
+                           format_func=lambda v: f"{v['name']} {v['plate']}")
     st.caption(f"{sel_date}（{WEEKDAY_JP[sel_date.weekday()]}）　区分：{day_status_label(sel_date)}"
                f"　予約可能：9:00〜{_min_to_hhmm(day_end_min_for(sel_date))}")
 
@@ -1447,9 +1494,21 @@ def page_reservation():
     # 操作対象：新規 or 既存予約（既存を選ぶとスライダーがその時間に入り、バーで訂正できる）
     options = [("new", "＋ 新規予約")] + [
         (r["id"], f'{r["start_time"]}-{r["end_time"]}　{r["user_name"]}') for r in day_rows]
+    # 日付や車両を変えると前回選んだ予約が選択肢から消えるため、その場合は新規に戻す
+    if st.session_state.get("resv_target") not in options:
+        st.session_state["resv_target"] = options[0]
+    # 予約をクリックして来た場合は、その予約を選択状態にする
+    if want_target_id is not None:
+        for o in options:
+            if o[0] == want_target_id:
+                st.session_state["resv_target"] = o
+                break
     target = st.selectbox("予約操作対象", options, format_func=lambda o: o[1], key="resv_target")
     target_id = target[0]
     editing = target_id != "new"
+    if editing and st.session_state.pop("_opened_by_click", False):
+        st.info(f"この予約を選択中です：{sel_date} {target[1]}　"
+                "　→ 取消すなら下の🟡黄色の「🗑 この予約を取消」ボタンを押してください。")
 
     if editing:
         cur = next(r for r in day_rows if r["id"] == target_id)
@@ -1861,10 +1920,30 @@ MANUAL_MD = """
 | ⬜ 白 | 空き |
 
 マスにマウスを乗せると、予約者・時間・行き先が表示されます。
+**色の付いたマス（予約済み）をクリックすると、その予約の変更・取消画面になります。**
 
 ---
 
 ## 3. 予約を変更・取消する
+
+### いちばん簡単な方法：予約をクリックする
+
+**入っている予約をクリック（スマホはタップ）するだけ**で、その予約を選んだ状態の
+予約画面が開きます。次のどこをクリックしてもOKです。
+
+- 📅 カレンダーの **予約バー**（色の付いた帯）
+- 📅 スマホ表示の **予約の行**
+- 🚗 車両予約画面の **青（または赤）のマス**、その下の予約一覧の文字
+
+開くと「この予約を選択中です：…」と表示され、そのまま
+**🟡 黄色の「🗑 この予約を取消」ボタン** で取消せます。
+時間を変えたいときは、スライダーを動かして
+**「この内容に更新（○○〜○○）」** を押します。
+
+> 💡 予約バーの**何もない余白**をクリックした場合は、これまでどおり
+> 「＋ 新規予約」の状態で開きます。
+
+### 手動で選ぶ方法
 
 1. 「🚗 車両予約」で、変更したい予約の **利用日** と **車両** を選びます。
 2. **「予約操作対象」** で対象の予約（例：`09:00-12:00　山田`）を選びます。
@@ -1872,10 +1951,10 @@ MANUAL_MD = """
 3. 変更する場合：スライダーや利用者名・行き先を直してから
    **「この内容に更新（○○〜○○）」** を押します。
 4. 取消す場合：**🟡 黄色の「🗑 この予約を取消」ボタン** を押します。
-   押した時点ですぐ削除されます（確認画面は出ません）。取消したい予約が
-   「予約操作対象」に表示されているか、必ず確認してから押してください。
 
-> 💡 取消ボタンは間違って押さないよう **黄色** で目立たせています。
+> ⚠️ 取消は押した時点ですぐ削除されます（確認画面は出ません）。
+> 取消したい予約が「予約操作対象」に表示されているか、必ず確認してから押してください。
+> 間違って押さないよう、ボタンは **黄色** で目立たせています。
 
 ---
 
@@ -1897,7 +1976,9 @@ MANUAL_MD = """
 - 上の **年・月** で表示する月を切り替えます。
 - **「📱 スマホ表示」** をオンにすると、1日ずつのカード表示になり、
   横スクロールなしで見られます（スマホ向け）。
-- カレンダー内のリンクから、その日の **予約変更・当番の入替・備考入力** に飛べます。
+- **予約バー（色の付いた帯）をクリック**すると、その予約の変更・取消画面が開きます。
+  帯のない**余白**をクリックすると、その日の新規予約になります。
+- カレンダー内のリンクから、その日の **当番の入替・備考入力** にも飛べます。
 - カレンダー下の編集表では、次の列を直接編集できます。
 
 | 列 | 内容 |
@@ -1949,6 +2030,10 @@ MANUAL_MD = """
 ---
 
 ## 7. よくある質問
+
+**Q. 予約を取消したい**
+　カレンダーや表の中の**その予約をクリック**すれば、選ばれた状態で開きます。
+　あとは黄色の「🗑 この予約を取消」を押すだけです。
 
 **Q. 予約を取消したのに表示が残っている**
 　ブラウザを再読み込み（F5）してください。
@@ -2098,6 +2183,14 @@ def main():
         if ds:
             try:
                 st.session_state["sched_date"] = datetime.date.fromisoformat(ds)
+            except ValueError:
+                pass
+        # 既存の予約をクリックした場合は rid（予約番号）が付く。
+        # その予約を選択状態にして、すぐ変更・取消できるようにする。
+        rid = qp.get("rid")
+        if rid:
+            try:
+                st.session_state["_open_resv_id"] = int(rid)
             except ValueError:
                 pass
         qp.clear()
