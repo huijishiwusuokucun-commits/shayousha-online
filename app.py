@@ -28,9 +28,12 @@ import streamlit as st
 # バージョン情報（改修履歴）
 #   画面左のメニュー下部に表示される。改修したら必ずここに追記すること。
 # ============================================================
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 APP_UPDATED = "2026-09-07"
 CHANGELOG = [
+    ("1.10.0", "2026-09-07",
+     "予約・更新したあとは自動でカレンダーのその日へ移動し、"
+     "予約した日を黄色で強調表示するように変更"),
     ("1.9.0", "2026-09-07",
      "予約済みの時間帯をクリックすると、その予約を選んだ状態で予約画面が開くように変更"
      "（そのまま黄色の「🗑 この予約を取消」ボタンで取消せる）／"
@@ -764,6 +767,12 @@ def save_day_override(d: datetime.date, duty, event, note, duty_swap, workday=No
 def page_calendar():
     st.subheader("📅 月間カレンダー（縦表示）")
 
+    # 予約・更新の直後に移動してきたときの結果表示と、その日の強調（1回だけ）
+    flash = st.session_state.pop("_flash", None)
+    if flash:
+        st.success(flash)
+    hl_iso = st.session_state.pop("_hl_date", None)
+
     today = jst_today()
     col1, col2 = st.columns(2)
     # 既定値をセッションに用意（リンク移動で当月へ戻らないよう key で保持する）
@@ -1008,6 +1017,7 @@ def page_calendar():
           .daycard.today {background:#fffbe0; border-color:#e0c000; border-width:2px;}
           .daycard.hol {background:#fdeeee;}
           .daycard.sat {background:#eef5ff;}
+          .daycard.justbooked {background:#fff59d; border-color:#f9a825; border-width:3px;}
           .dc-date {font-size:21px; font-weight:800;}
           .dc-date .badge {font-size:13px; border-radius:4px; padding:1px 6px;
                            color:#fff; margin-left:6px;}
@@ -1034,6 +1044,8 @@ def page_calendar():
                 cls.append("sat")
             if d == today:
                 cls.append("today")
+            if hl_iso and d.isoformat() == hl_iso:
+                cls.append("justbooked")
             iso = d.isoformat()
             qs = f"&y={year}&m={month}"   # 表示中の年月を引き継ぐ
 
@@ -1163,6 +1175,10 @@ def page_calendar():
       table.vcal tr.sat td.dcell {{background:#eef5ff;}}
       table.vcal tr.hol td.dcell {{background:#fdeeee;}}
       table.vcal tr.today td.dcell {{background:#fffbe0;}}
+      /* 予約・更新した直後の日を目立たせる */
+      tr.justbooked td {{background:#fff59d !important;}}
+      table.vcal tr.justbooked td.dcell {{background:#fff59d;
+                                          box-shadow:inset -1px 0 0 #ccc, inset 3px 0 0 #f9a825;}}
       .red {{color:#d00; font-weight:bold;}}
       .blue {{color:#06c; font-weight:bold;}}
       .todaydate {{font-size:19px; font-weight:900; color:#000;}}
@@ -1217,6 +1233,8 @@ def page_calendar():
             row_cls.append("sat")
         if d == today:
             row_cls.append("today")
+        if hl_iso and d.isoformat() == hl_iso:      # 予約した日を黄色で強調
+            row_cls.append("justbooked")
 
         date_cls = "blue" if wd == 5 else ("red" if not workday else "")
         if d == today:
@@ -1599,8 +1617,16 @@ def page_reservation():
                              f"（{dup['start_time']}-{dup['end_time']} {dup['user_name']}）。"
                              "スライダーで別の時間帯を選んでください。")
                 else:
-                    st.success(("更新しました：" if editing else "予約しました：")
-                               + f"{sel_date} {start_s}-{end_s} {vehicle['name']}（{user_name}）")
+                    # 予約・更新が終わったらカレンダーのその日へ移動して結果を確認できるようにする。
+                    # （メニューの切替は画面の先頭で行う必要があるため、URLのパラメータ経由で移動する）
+                    st.session_state["_flash"] = (
+                        ("✅ 更新しました：" if editing else "✅ 予約しました：")
+                        + f"{sel_date}（{WEEKDAY_JP[sel_date.weekday()]}）"
+                        + f" {start_s}-{end_s} {vehicle['name']}（{user_name}）")
+                    st.session_state["_hl_date"] = sel_date.isoformat()
+                    st.query_params.update({
+                        "nav": "cal", "date": sel_date.isoformat(),
+                        "y": str(sel_date.year), "m": str(sel_date.month)})
                     st.rerun()
 
     # 今後の予約一覧（クリックで直接編集）
@@ -1897,6 +1923,9 @@ MANUAL_MD = """
 5. **利用者名**（掃除当番の名簿から選択）と **行き先・目的** を入れます。
 6. 他の人に譲ってもよい予約なら **「🔁 この時間帯は他の人に譲れます」** にチェック。
 7. **「この時間で予約する（○○〜○○）」** を押すと登録されます。
+8. 登録すると **自動で📅カレンダーのその日へ移動** し、画面の上に
+   「✅ 予約しました：…」と表示され、**予約した日が黄色で強調**されます。
+   そのまま予約が入ったことを確認できます。
 
 ### 予約できる時間
 
@@ -1950,7 +1979,9 @@ MANUAL_MD = """
    → スライダーにその予約の時間が入ります。
 3. 変更する場合：スライダーや利用者名・行き先を直してから
    **「この内容に更新（○○〜○○）」** を押します。
+   → 更新後も自動で📅カレンダーのその日へ移動します。
 4. 取消す場合：**🟡 黄色の「🗑 この予約を取消」ボタン** を押します。
+   → 取消のときは予約画面にとどまります（続けて別の予約を操作できます）。
 
 > ⚠️ 取消は押した時点ですぐ削除されます（確認画面は出ません）。
 > 取消したい予約が「予約操作対象」に表示されているか、必ず確認してから押してください。
@@ -2044,6 +2075,11 @@ MANUAL_MD = """
 **Q. 誰かの予約と重なってしまう**
 　表で 🟥赤×（重複）になっていると登録できません。相手の予約が
 　🔴赤字（譲れます）なら、その人に声をかけて調整してください。
+
+**Q. 予約したあと、カレンダーに戻ってしまう**
+　仕様です。予約が正しく入ったかをその場で確認できるよう、予約・更新の直後は
+　カレンダーのその日（黄色で強調）へ自動で移動します。続けて予約するときは
+　左メニューの「🚗 車両予約」を押してください。
 
 **Q. データはどこに保存される？**
 　左メニュー下の「💾 保存先」に表示されています。
@@ -2193,6 +2229,10 @@ def main():
                 st.session_state["_open_resv_id"] = int(rid)
             except ValueError:
                 pass
+        qp.clear()
+    elif nav == "cal":                      # 予約・更新の直後 → カレンダーのその日へ
+        st.session_state["menu"] = "📅 カレンダー"
+        _restore_cal_month()
         qp.clear()
     elif nav == "note":                     # 備考クリック → カレンダーで備考入力を開く
         st.session_state["menu"] = "📅 カレンダー"
