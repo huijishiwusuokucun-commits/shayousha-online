@@ -23,14 +23,18 @@ from pathlib import Path
 import jpholiday
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ============================================================
 # バージョン情報（改修履歴）
 #   画面左のメニュー下部に表示される。改修したら必ずここに追記すること。
 # ============================================================
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 APP_UPDATED = "2026-09-07"
 CHANGELOG = [
+    ("1.11.0", "2026-09-07",
+     "予約を取消したあとも自動でカレンダーへ移動するように変更／"
+     "画面移動したときに、ページの一番上（カレンダーの先頭）まで自動でスクロールするように変更"),
     ("1.10.0", "2026-09-07",
      "予約・更新したあとは自動でカレンダーのその日へ移動し、"
      "予約した日を黄色で強調表示するように変更"),
@@ -764,7 +768,44 @@ def save_day_override(d: datetime.date, duty, event, note, duty_swap, workday=No
 # ============================================================
 # 画面：カレンダー（月初〜月末の縦表示・クリックで直接編集）
 # ============================================================
+def scroll_to_top_if_requested():
+    """画面移動の直後だけ、ページの一番上まで自動スクロールする。
+
+    Streamlit の画面移動はページを再読み込みしないため、そのままだと
+    前の画面のスクロール位置（画面の下の方）に留まってしまう。
+    小さな部品（iframe）を1つ描画し、その中の JavaScript から
+    親ページをスクロールさせる。"""
+    if not st.session_state.pop("_scroll_top", False):
+        return
+    js = """
+        <script>
+          const goTop = () => {
+            try {
+              const doc = window.parent.document;
+              const targets = [
+                doc.querySelector('section.main'),
+                doc.querySelector('[data-testid="stMain"]'),
+                doc.querySelector('[data-testid="stAppViewContainer"]'),
+                doc.scrollingElement, doc.documentElement, doc.body,
+              ];
+              for (const t of targets) { if (t) { t.scrollTop = 0; } }
+              window.parent.scrollTo(0, 0);
+            } catch (e) { /* 何もしない（環境によっては操作できないため） */ }
+          };
+          goTop();
+          setTimeout(goTop, 60);
+          setTimeout(goTop, 250);
+        </script>
+        """
+    # st.iframe は新しいStreamlit用。古い版では components.html を使う。
+    if hasattr(st, "iframe"):
+        st.iframe(js, height=1)      # 0は指定できないため1px（ほぼ見えない）
+    else:
+        components.html(js, height=0)
+
+
 def page_calendar():
+    scroll_to_top_if_requested()
     st.subheader("📅 月間カレンダー（縦表示）")
 
     # 予約・更新の直後に移動してきたときの結果表示と、その日の強調（1回だけ）
@@ -1466,6 +1507,7 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
 
 
 def page_reservation():
+    scroll_to_top_if_requested()
     st.subheader("🚗 社用車の予約（15分刻み。9:00〜。2月は20:00・3月は21:00まで）")
 
     vehicles = get_vehicles()
@@ -1583,7 +1625,14 @@ def page_reservation():
         if do_delete:
             with get_conn() as conn:
                 conn.execute("DELETE FROM reservations WHERE id=?", (target_id,))
-            st.success("予約を取消しました。")
+            # 取消のあともカレンダーのその日へ移動して、空いたことを確認できるようにする
+            st.session_state["_flash"] = (
+                f"🗑 予約を取消しました：{sel_date}（{WEEKDAY_JP[sel_date.weekday()]}）"
+                f" {def_range[0]}-{def_range[1]} {vehicle['name']}（{def_name}）")
+            st.session_state["_hl_date"] = sel_date.isoformat()
+            st.query_params.update({
+                "nav": "cal", "date": sel_date.isoformat(),
+                "y": str(sel_date.year), "m": str(sel_date.month)})
             st.rerun()
         elif do_save:
             if not user_name:
@@ -1926,6 +1975,7 @@ MANUAL_MD = """
 8. 登録すると **自動で📅カレンダーのその日へ移動** し、画面の上に
    「✅ 予約しました：…」と表示され、**予約した日が黄色で強調**されます。
    そのまま予約が入ったことを確認できます。
+   （画面は自動でいちばん上まで戻ります）
 
 ### 予約できる時間
 
@@ -1981,7 +2031,8 @@ MANUAL_MD = """
    **「この内容に更新（○○〜○○）」** を押します。
    → 更新後も自動で📅カレンダーのその日へ移動します。
 4. 取消す場合：**🟡 黄色の「🗑 この予約を取消」ボタン** を押します。
-   → 取消のときは予約画面にとどまります（続けて別の予約を操作できます）。
+   → 取消したあとも自動で📅カレンダーのその日へ移動し、
+   「🗑 予約を取消しました：…」と表示されます。空いたことをその場で確認できます。
 
 > ⚠️ 取消は押した時点ですぐ削除されます（確認画面は出ません）。
 > 取消したい予約が「予約操作対象」に表示されているか、必ず確認してから押してください。
@@ -2077,9 +2128,9 @@ MANUAL_MD = """
 　🔴赤字（譲れます）なら、その人に声をかけて調整してください。
 
 **Q. 予約したあと、カレンダーに戻ってしまう**
-　仕様です。予約が正しく入ったかをその場で確認できるよう、予約・更新の直後は
-　カレンダーのその日（黄色で強調）へ自動で移動します。続けて予約するときは
-　左メニューの「🚗 車両予約」を押してください。
+　仕様です。予約が正しく入ったかをその場で確認できるよう、予約・更新・取消の
+　直後はカレンダーのその日（黄色で強調）へ自動で移動し、画面のいちばん上を
+　表示します。続けて予約するときは左メニューの「🚗 車両予約」を押してください。
 
 **Q. データはどこに保存される？**
 　左メニュー下の「💾 保存先」に表示されています。
@@ -2214,6 +2265,7 @@ def main():
 
     if nav == "resv":                       # 時間帯クリック → 車両予約画面へ
         st.session_state["menu"] = "🚗 車両予約"
+        st.session_state["_scroll_top"] = True
         _restore_cal_month()
         ds = qp.get("date")
         if ds:
@@ -2230,8 +2282,9 @@ def main():
             except ValueError:
                 pass
         qp.clear()
-    elif nav == "cal":                      # 予約・更新の直後 → カレンダーのその日へ
+    elif nav == "cal":                      # 予約・更新・取消の直後 → カレンダーの先頭へ
         st.session_state["menu"] = "📅 カレンダー"
+        st.session_state["_scroll_top"] = True
         _restore_cal_month()
         qp.clear()
     elif nav == "note":                     # 備考クリック → カレンダーで備考入力を開く
