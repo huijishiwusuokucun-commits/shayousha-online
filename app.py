@@ -28,9 +28,13 @@ import streamlit as st
 # バージョン情報（改修履歴）
 #   画面左のメニュー下部に表示される。改修したら必ずここに追記すること。
 # ============================================================
-APP_VERSION = "1.7.1"
-APP_UPDATED = "2026-08-12"
+APP_VERSION = "1.8.0"
+APP_UPDATED = "2026-09-07"
 CHANGELOG = [
+    ("1.8.0", "2026-09-07",
+     "予約時間を15分刻みに変更（タイムスケジュール表も15分刻み・正時に区切り線）／"
+     "「🗑 この予約を取消」ボタンを黄色に変更／"
+     "メニューに「📖 マニュアル」を追加（アプリ内で使い方を確認できる）"),
     ("1.7.1", "2026-08-12",
      "「no such column: workday」エラーを修正／"
      "コード更新時にデータベースの更新が確実に実行されるようにした"),
@@ -1305,20 +1309,25 @@ def _min_to_hhmm(m: int) -> str:
     return f"{m // 60:02d}:{m % 60:02d}"
 
 
+# 予約時間の刻み（分）。15＝15分単位で予約できる。
+SLOT_STEP_MIN = 15
+
+
 def time_slots_for(d: datetime.date):
-    """その日の予約可能時刻（30分刻み、9:00〜終了時刻）のリスト。"""
+    """その日の予約可能時刻（15分刻み、9:00〜終了時刻）のリスト。"""
     end = day_end_min_for(d)
-    return [_min_to_hhmm(t) for t in range(DAY_START_MIN, end + 1, 30)]
+    return [_min_to_hhmm(t) for t in range(DAY_START_MIN, end + 1, SLOT_STEP_MIN)]
 
 
 # 一覧表の選択肢用の最大範囲（9:00〜21:00）。実際の締切は各月のルールに従う。
-TIME_SLOTS_MAX = [_min_to_hhmm(t) for t in range(DAY_START_MIN, 21 * 60 + 1, 30)]
+TIME_SLOTS_MAX = [_min_to_hhmm(t)
+                  for t in range(DAY_START_MIN, 21 * 60 + 1, SLOT_STEP_MIN)]
 
 
 def render_schedule_grid(date: datetime.date, vehicles: list,
                          preview_vehicle_id=None, preview_range=None, exclude_id=None):
     """
-    選択日の車両別タイムスケジュール表（30分刻み）をHTMLで描画する。
+    選択日の車両別タイムスケジュール表（15分刻み）をHTMLで描画する。
     preview_range=(開始, 終了) を渡すと、その車両の選択中の時間帯を色で表示する
     （空きなら緑、既存予約と重なるなら赤で警告）。
     exclude_id を渡すと、その予約は「予約済み」表示から除外する（修正中の予約用）。
@@ -1339,13 +1348,15 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
     pv_start, pv_end = (preview_range or (None, None))
 
     slots_full = time_slots_for(date)       # その日の可能時刻（月により終了が変わる）
-    slot_starts = slots_full[:-1]           # 各セルの開始時刻
+    slot_starts = slots_full[:-1]           # 各セルの開始時刻（15分ごと）
     html = """
     <style>
       table.sched {border-collapse:collapse; width:100%; table-layout:fixed;}
-      table.sched th {border:1px solid #bbb; background:#f0f2f6; font-size:13px; padding:2px 0;}
-      table.sched td {border:1px solid #bbb; height:32px; padding:0; text-align:center;
-                      font-size:13px; overflow:hidden; white-space:nowrap;}
+      table.sched th {border:1px solid #ddd; background:#f0f2f6; font-size:11px; padding:2px 0;
+                      overflow:hidden;}
+      table.sched td {border:1px solid #ddd; height:32px; padding:0; text-align:center;
+                      font-size:11px; overflow:hidden; white-space:nowrap;}
+      table.sched th.hour, table.sched td.hour {border-left:2px solid #888;}
       table.sched td.veh {background:#f0f2f6; font-weight:bold; font-size:14px; padding:0 4px;
                           text-align:left; white-space:normal;}
       td.booked {background:#64b5f6; color:#fff;}
@@ -1356,9 +1367,12 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
     </style>
     <table class="sched"><tr><th style="width:120px;">車両</th>"""
     for s in slot_starts:
-        # 正時のみラベル表示（30分セルは空欄でスッキリさせる）
-        label = s if s.endswith(":00") else ""
-        html += f"<th>{label}</th>"
+        # 正時のみラベル表示（15・30・45分のセルは空欄でスッキリさせる）
+        # 15分刻みで列が細いため、見出しは「9」「10」…と時だけ表示する
+        is_hour = s.endswith(":00")
+        label = str(int(s[:2])) if is_hour else ""
+        html += f'<th class="{"hour" if is_hour else ""}">{label}</th>'
+
     html += "</tr>"
 
     for v in vehicles:
@@ -1367,27 +1381,28 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
             slot_end = slots_full[i + 1]
             hit = None
             for r in resv_by_vehicle.get(v["id"], []):
-                # このセル(30分)と予約時間帯が重なるか
+                # このセル(15分)と予約時間帯が重なるか
                 if r["start_time"] < slot_end and r["end_time"] > s:
                     hit = r
                     break
             # 選択中の時間帯か（プレビュー対象の車両のみ）
             selected = (preview_range and v["id"] == preview_vehicle_id
                         and pv_start <= s and slot_end <= pv_end)
+            hour_cls = " hour" if s.endswith(":00") else ""
             if hit and selected:
-                html += (f'<td class="conflict" title="重複：{hit["start_time"]}-'
+                html += (f'<td class="conflict{hour_cls}" title="重複：{hit["start_time"]}-'
                          f'{hit["end_time"]} {hit["user_name"]}">×</td>')
             elif hit:
                 text = hit["user_name"] if hit["start_time"] == s or i == 0 else ""
                 cls = "yield" if hit.get("transferable") else "booked"
                 ymark = "（譲れます）" if hit.get("transferable") else ""
-                html += (f'<td class="{cls}" '
+                html += (f'<td class="{cls}{hour_cls}" '
                          f'title="{hit["start_time"]}-{hit["end_time"]} '
                          f'{hit["user_name"]} {hit["purpose"]}{ymark}">{text}</td>')
             elif selected:
-                html += '<td class="select"></td>'
+                html += f'<td class="select{hour_cls}"></td>'
             else:
-                html += '<td class="free"></td>'
+                html += f'<td class="free{hour_cls}"></td>'
         html += "</tr>"
     html += "</table>"
     st.markdown(html, unsafe_allow_html=True)
@@ -1406,14 +1421,14 @@ def render_schedule_grid(date: datetime.date, vehicles: list,
 
 
 def page_reservation():
-    st.subheader("🚗 社用車の予約（9:00〜。2月は20:00・3月は21:00まで）")
+    st.subheader("🚗 社用車の予約（15分刻み。9:00〜。2月は20:00・3月は21:00まで）")
 
     vehicles = get_vehicles()
     if not vehicles:
         st.warning("車両が未登録です。「🚙 車両管理」画面で先に登録してください。")
         return
 
-    st.markdown("#### 予約の追加・修正：時間帯はスライダーで調整")
+    st.markdown("#### 予約の追加・修正：時間帯はスライダーで調整（15分刻み）")
     c1, c2 = st.columns(2)
     sel_date = c1.date_input("利用日", jst_today(), key="sched_date")
     vehicle = c2.selectbox("車両", vehicles, format_func=lambda v: f"{v['name']} {v['plate']}")
@@ -1452,7 +1467,7 @@ def page_reservation():
     def_range = (def_range[0] if def_range[0] in slots else slots[0],
                  def_range[1] if def_range[1] in slots else slots[-1])
     start_s, end_s = st.select_slider(
-        "予約する時間帯（両端をドラッグ）", options=slots,
+        "予約する時間帯（両端をドラッグ／15分刻み）", options=slots,
         value=def_range, key=f"resv_range_{vehicle['id']}_{target_id}")
     c3, c4 = st.columns(2)
     # 利用者名は掃除当番の名簿（番号順）から選ぶ。名簿外の既存名も選べるよう先頭に残す
@@ -1475,7 +1490,7 @@ def page_reservation():
     render_schedule_grid(sel_date, vehicles, preview_vehicle_id=vehicle["id"],
                          preview_range=(start_s, end_s),
                          exclude_id=(target_id if editing else None))
-    st.caption("青＝予約済み　🔴赤＝他の人に譲れる予約　🟩緑＝選択中の時間帯　🟥赤×＝重複（取れません）")
+    st.caption("表は15分刻み（太い縦線が正時）。青＝予約済み　🔴赤＝他の人に譲れる予約　🟩緑＝選択中の時間帯　🟥赤×＝重複（取れません）")
 
     if start_s >= end_s:
         st.warning("終了は開始より後になるよう、スライダーの右端を動かしてください。")
@@ -1797,6 +1812,179 @@ def page_settings():
 
 
 # ============================================================
+# 画面：マニュアル（使い方）
+#   ※ 内容を直したら CHANGELOG にも追記すること。
+# ============================================================
+MANUAL_MD = """
+## 1. この画面でできること
+
+| 画面 | 内容 |
+|------|------|
+| 📅 カレンダー | 月初〜月末を縦に表示。出勤日／休み（🟢出勤・🔴休）、車両予約の時間帯バー、🧹掃除当番、📌朝礼当番、📝備考を一覧できます。表のマスをクリックして直接編集もできます |
+| 🚗 車両予約 | **15分刻み**での予約の追加・修正・取消。重複予約は自動でブロックされます |
+| 🚙 車両管理 | 社用車の登録・使用停止 |
+| ⚙️ 設定 | 掃除当番メンバーの登録・並び替え、ローテーション起算日、月曜行事の名前 |
+| 📖 マニュアル | この画面です |
+
+---
+
+## 2. 車両を予約する（15分刻み）
+
+1. 左メニューの **「🚗 車両予約」** を開きます。
+2. **利用日** と **車両** を選びます。
+3. 「予約操作対象」で **「＋ 新規予約」** を選びます。
+4. **スライダーの両端をドラッグ**して時間帯を決めます。
+   目盛りは **15分刻み**（9:00 / 9:15 / 9:30 / 9:45 / 10:00 …）です。
+5. **利用者名**（掃除当番の名簿から選択）と **行き先・目的** を入れます。
+6. 他の人に譲ってもよい予約なら **「🔁 この時間帯は他の人に譲れます」** にチェック。
+7. **「この時間で予約する（○○〜○○）」** を押すと登録されます。
+
+### 予約できる時間
+
+| 月 | 予約できる時間 |
+|----|----------------|
+| 通常の月 | 9:00 〜 17:30 |
+| 2月 | 9:00 〜 20:00 |
+| 3月 | 9:00 〜 21:00 |
+
+### タイムスケジュール表の色
+
+スライダーの下に、その日の車両別の空き状況が **15分刻み**で表示されます
+（太い縦線が正時＝○時ちょうどの区切りです）。
+
+| 色 | 意味 |
+|----|------|
+| 🟦 青 | すでに予約が入っている |
+| 🟥 赤 | 予約済みだが「他の人に譲れます」の予約 |
+| 🟩 緑 | いま選択中の時間帯（この時間で予約できます） |
+| 🟥 赤に × | 選択中の時間帯が既存の予約と重なっている（このままでは予約できません） |
+| ⬜ 白 | 空き |
+
+マスにマウスを乗せると、予約者・時間・行き先が表示されます。
+
+---
+
+## 3. 予約を変更・取消する
+
+1. 「🚗 車両予約」で、変更したい予約の **利用日** と **車両** を選びます。
+2. **「予約操作対象」** で対象の予約（例：`09:00-12:00　山田`）を選びます。
+   → スライダーにその予約の時間が入ります。
+3. 変更する場合：スライダーや利用者名・行き先を直してから
+   **「この内容に更新（○○〜○○）」** を押します。
+4. 取消す場合：**🟡 黄色の「🗑 この予約を取消」ボタン** を押します。
+   押した時点ですぐ削除されます（確認画面は出ません）。取消したい予約が
+   「予約操作対象」に表示されているか、必ず確認してから押してください。
+
+> 💡 取消ボタンは間違って押さないよう **黄色** で目立たせています。
+
+---
+
+## 4. 予約一覧をまとめて直す
+
+「🚗 車両予約」画面の下にある **「今後の予約一覧」** の表は、マスをクリックして
+直接書き換えられます。開始・終了の時刻も **15分刻み**で選べます。
+
+- 最終行に入力すると **追加**
+- 行頭のチェックを入れて Delete キーで **削除**
+- 直したあとは必ず **「💾 保存」** を押してください
+
+保存時に、同じ車両・同じ日で時間が重なっているとエラーになります。
+
+---
+
+## 5. カレンダーの使い方
+
+- 上の **年・月** で表示する月を切り替えます。
+- **「📱 スマホ表示」** をオンにすると、1日ずつのカード表示になり、
+  横スクロールなしで見られます（スマホ向け）。
+- カレンダー内のリンクから、その日の **予約変更・当番の入替・備考入力** に飛べます。
+- カレンダー下の編集表では、次の列を直接編集できます。
+
+| 列 | 内容 |
+|----|------|
+| 🧹 掃除当番 | 名簿のメンバーに変えると、その日以降も名簿順で続きます |
+| 🔁 入替 | その日だけ別の人が代わる場合に入力（順番自体は変わりません） |
+| 📌 朝礼当番 | 変えると、その週以降も名簿順で続きます |
+| 📝 備考 | その日のメモ |
+| ✏️ 出勤/休 | 「自動」「🟢 出勤」「🔴 休」から選択（臨時休業・休日出勤） |
+
+編集後は **「💾 保存」** を押してください。
+
+### 出勤日の自動判定
+
+日曜・祝日・年末休暇（12月28日〜翌年1月4日）は休みです。土曜は下記のとおりです。
+
+| 月 | 土曜の出勤ルール |
+|----|------------------|
+| 1月 | 1〜4日は年末休暇。それ以降の土曜は全て出勤 |
+| 2月 | 全て出勤 |
+| 3月 | 20日を含む週の土曜のみ休み |
+| 4月 | 第2・第3土曜が休み |
+| 5月 | 全て出勤 |
+| 6〜10月 | 第1〜第3土曜が休み（第4・第5土曜のみ出勤） |
+| 11・12月 | 第2・第3土曜が休み。12月28日以降は年末休暇 |
+
+⚠️ 掃除当番は出勤日を数えて割り当てるため、「✏️ 出勤/休」を変えると
+その日以降の当番の順番がずれます。
+
+---
+
+## 6. 車両管理・設定
+
+### 🚙 車両管理
+表のマスをクリックして、車両名・ナンバーを編集できます。最終行で追加。
+使わなくなった車両は「使用中」のチェックを外すと、予約画面に出なくなります。
+（過去の予約は残ります）
+
+### ⚙️ 設定
+| 項目 | 内容 |
+|------|------|
+| 掃除当番メンバー | 「順番」の小さい順に当番が回ります。行の追加・削除も可 |
+| ローテーション起算日 | この日（の出勤日）から1番目の人が当番になります |
+| 毎週月曜の行事 | 行事の名前（例：朝礼、ゴミ出し、車両点検）。月曜が祝日なら翌出勤日に振替 |
+| 月曜行事も当番制にする | オンにすると、名簿順で週替わりに担当が回ります |
+
+変更したら各セクションの **「💾 保存」** を押してください。
+
+---
+
+## 7. よくある質問
+
+**Q. 予約を取消したのに表示が残っている**
+　ブラウザを再読み込み（F5）してください。
+
+**Q. 9:10 から予約したい**
+　時刻は15分刻み（00分・15分・30分・45分）です。9:00 か 9:15 を選んでください。
+
+**Q. 誰かの予約と重なってしまう**
+　表で 🟥赤×（重複）になっていると登録できません。相手の予約が
+　🔴赤字（譲れます）なら、その人に声をかけて調整してください。
+
+**Q. データはどこに保存される？**
+　左メニュー下の「💾 保存先」に表示されています。
+　☁️ Turso（クラウド）＝全員で同じデータを共有。ローカル＝そのサーバー内のみ。
+
+---
+
+## 8. 変更履歴
+
+左メニュー下の **「改修履歴を見る」** に、いつ何を直したかが記録されています。
+不具合や要望は、バージョン番号（左メニュー下に表示）を添えてご連絡ください。
+"""
+
+
+def page_manual():
+    st.subheader("📖 マニュアル（使い方）")
+    st.caption(f"このマニュアルは v{APP_VERSION}（{APP_UPDATED} 更新）時点の内容です。")
+    st.download_button(
+        "⬇️ マニュアルを保存（Markdown）", data=MANUAL_MD.encode("utf-8"),
+        file_name="社用車管理アプリ_マニュアル.md", mime="text/markdown",
+        key="manual_dl")
+    st.divider()
+    st.markdown(MANUAL_MD)
+
+
+# ============================================================
 # ログイン（社外公開時のパスワード保護）
 # ============================================================
 def _get_app_password():
@@ -1867,6 +2055,19 @@ def main():
           }
           [data-testid="stDataFrame"] div, [data-testid="stDataEditor"] div { font-size: 16px; }
           .stButton button { font-size: 18px; }
+
+          /* 「🗑 この予約を取消」ボタンを黄色にする（key="resv_delete"） */
+          .st-key-resv_delete button {
+              background-color: #ffd54f !important;
+              border: 2px solid #f9a825 !important;
+              color: #212121 !important;
+              font-weight: bold !important;
+          }
+          .st-key-resv_delete button:hover {
+              background-color: #ffca28 !important;
+              border-color: #f57f17 !important;
+              color: #000 !important;
+          }
           h1 {font-size: 2.1rem;} h2 {font-size: 1.7rem;} h3 {font-size: 1.4rem;}
         </style>
         """,
@@ -1921,7 +2122,7 @@ def main():
         st.header("メニュー")
         page = st.radio(
             "画面を選択",
-            ["📅 カレンダー", "🚗 車両予約", "🚙 車両管理", "⚙️ 設定"],
+            ["📅 カレンダー", "🚗 車両予約", "🚙 車両管理", "⚙️ 設定", "📖 マニュアル"],
             label_visibility="collapsed",
             key="menu",
         )
@@ -1951,6 +2152,8 @@ def main():
             page_vehicles()
         elif page == "⚙️ 設定":
             page_settings()
+        elif page == "📖 マニュアル":
+            page_manual()
     except Exception as e:
         # 「no such column: ○○」＝ DBに列が足りない（マイグレーション未実行）。
         # スキーマ版数の上げ忘れなどで起きるため、1度だけ作り直して自動で復旧する。
