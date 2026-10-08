@@ -31,9 +31,12 @@ import streamlit.components.v1 as components
 #   【版数の付け方】小数と同じ大小関係になるよう、真ん中の数字は 0〜9 まで。
 #   1.9.0 の次は 1.10.0 ではなく 2.0.0 とする（1.10 が 1.9 より古く見えるため）。
 # ============================================================
-APP_VERSION = "2.1.0"
-APP_UPDATED = "2026-09-07"
+APP_VERSION = "2.2.0"
+APP_UPDATED = "2026-10-08"
 CHANGELOG = [
+    ("2.2.0", "2026-10-08",
+     "車両予約の利用者名に「検討会」を追加（掃除当番・朝礼当番には入らない）／"
+     "設定画面に「予約専用の利用者名」を追加し、当番に入れない利用者名を登録できるようにした"),
     ("2.1.0", "2026-09-07",
      "予約を取消したあとも自動でカレンダーへ移動するように変更／"
      "画面移動したときに、ページの一番上（カレンダーの先頭）まで自動でスクロールするように変更"),
@@ -103,6 +106,9 @@ def jst_today() -> datetime.date:
 DB_PATH = Path(os.environ.get("SHAYOSHA_DB", Path(__file__).parent / "shayosha.db"))
 
 WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
+
+# 予約専用の利用者名の初期値（1行に1名。掃除当番・朝礼当番には入らない）
+RESV_EXTRA_USERS_DEFAULT = "検討会"
 
 
 # ============================================================
@@ -418,6 +424,7 @@ def init_db():
             "weekly_event_name": "朝礼",           # 名前は設定画面で変更可能
             "rotation_base_date": "2026-01-05",    # 掃除当番ローテーションの起算日
             "weekly_event_rotation": "1",          # 朝礼を週替わり当番制にするか（0/1）
+            "resv_extra_users": RESV_EXTRA_USERS_DEFAULT,  # 予約専用の利用者名（当番には入らない）
         }
         writes = alters + [
             ("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v))
@@ -477,6 +484,23 @@ def set_setting(key, value):
 def get_members():
     """掃除当番メンバーを並び順で取得（キャッシュ）"""
     return _members_cached()
+
+
+def get_resv_extra_users():
+    """予約専用の利用者名（掃除当番・朝礼当番には入らない）。設定画面で編集できる。"""
+    raw = get_setting("resv_extra_users", RESV_EXTRA_USERS_DEFAULT) or ""
+    names = []
+    for line in raw.splitlines():
+        name = line.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def get_resv_user_names():
+    """車両予約の利用者名の選択肢＝掃除当番の名簿（番号順）＋予約専用の利用者名"""
+    names = [m["name"] for m in get_members()]
+    return names + [n for n in get_resv_extra_users() if n not in names]
 
 
 def get_vehicles(active_only=True):
@@ -1591,8 +1615,8 @@ def page_reservation():
         "予約する時間帯（両端をドラッグ／15分刻み）", options=slots,
         value=def_range, key=f"resv_range_{vehicle['id']}_{target_id}")
     c3, c4 = st.columns(2)
-    # 利用者名は掃除当番の名簿（番号順）から選ぶ。名簿外の既存名も選べるよう先頭に残す
-    user_opts = [m["name"] for m in get_members()]
+    # 利用者名は掃除当番の名簿（番号順）＋予約専用の利用者名から選ぶ。名簿外の既存名も選べるよう先頭に残す
+    user_opts = get_resv_user_names()
     if def_name and def_name not in user_opts:
         user_opts = [def_name] + user_opts
     if user_opts:
@@ -1714,8 +1738,8 @@ def page_reservation():
         })
     rdf = pd.DataFrame(rdf_rows) if rdf_rows else pd.DataFrame(columns=list_cols)
 
-    # 利用者名の選択肢＝掃除当番の名簿（番号順）＋既存予約の名簿外の名前
-    user_options = [m["name"] for m in get_members()]
+    # 利用者名の選択肢＝掃除当番の名簿（番号順）＋予約専用の利用者名＋既存予約の名簿外の名前
+    user_options = get_resv_user_names()
     for r in rows:
         if r["user_name"] and r["user_name"] not in user_options:
             user_options.append(r["user_name"])
@@ -1917,6 +1941,21 @@ def page_settings():
 
     st.divider()
 
+    # --- 予約専用の利用者名（当番には入らない）---
+    st.markdown("#### 🚗 予約専用の利用者名")
+    st.caption("車両予約の「利用者名」にだけ出る名前です（例：検討会）。"
+               "掃除当番・朝礼当番には入りません。1行に1つずつ入力し、「💾 保存」を押してください。")
+    cur_extra = "\n".join(get_resv_extra_users())
+    new_extra = st.text_area("予約専用の利用者名", value=cur_extra, height=100,
+                             label_visibility="collapsed", key="resv_extra_users_input")
+    if st.button("💾 保存", type="primary", key="resv_extra_save"):
+        set_setting("resv_extra_users", "\n".join(
+            dict.fromkeys(s.strip() for s in new_extra.splitlines() if s.strip())))
+        st.success("保存しました。")
+        st.rerun()
+
+    st.divider()
+
     # --- ローテーション起算日 ---
     st.markdown("#### 📆 ローテーション起算日")
     st.caption("この日（の営業日）から1番目のメンバーが当番になります。")
@@ -1959,7 +1998,7 @@ MANUAL_MD = """
 | 📅 カレンダー | 月初〜月末を縦に表示。出勤日／休み（🟢出勤・🔴休）、車両予約の時間帯バー、🧹掃除当番、📌朝礼当番、📝備考を一覧できます。表のマスをクリックして直接編集もできます |
 | 🚗 車両予約 | **15分刻み**での予約の追加・修正・取消。重複予約は自動でブロックされます |
 | 🚙 車両管理 | 社用車の登録・使用停止 |
-| ⚙️ 設定 | 掃除当番メンバーの登録・並び替え、ローテーション起算日、月曜行事の名前 |
+| ⚙️ 設定 | 掃除当番メンバーの登録・並び替え、予約専用の利用者名（当番に入れない名前）、ローテーション起算日、月曜行事の名前 |
 | 📖 マニュアル | この画面です |
 
 ---
@@ -1971,7 +2010,7 @@ MANUAL_MD = """
 3. 「予約操作対象」で **「＋ 新規予約」** を選びます。
 4. **スライダーの両端をドラッグ**して時間帯を決めます。
    目盛りは **15分刻み**（9:00 / 9:15 / 9:30 / 9:45 / 10:00 …）です。
-5. **利用者名**（掃除当番の名簿から選択）と **行き先・目的** を入れます。
+5. **利用者名**（掃除当番の名簿、または「検討会」など予約専用の名前から選択）と **行き先・目的** を入れます。
 6. 他の人に譲ってもよい予約なら **「🔁 この時間帯は他の人に譲れます」** にチェック。
 7. **「この時間で予約する（○○〜○○）」** を押すと登録されます。
 8. 登録すると **自動で📅カレンダーのその日へ移動** し、画面の上に
